@@ -74,7 +74,13 @@ class StateManager:
         request_store = _request_store_id.get()
         if request_store is not None:
             return request_store
-        return cast(str | None, _shared_state["default_store_id"])
+        store = cast(str | None, _shared_state["default_store_id"])
+        if store is None:
+            # HEB_DEFAULT_STORE was documented but never read: fall back to it.
+            from texas_grocery_mcp.utils.config import get_settings
+
+            store = get_settings().heb_default_store
+        return store
 
     @staticmethod
     async def set_default_store_id(store_id: str | None) -> None:
