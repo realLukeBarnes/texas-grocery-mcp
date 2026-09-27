@@ -199,3 +199,21 @@ class TestStateManagerConcurrency:
         assert StateManager.get_cached_store("111") is not None
         assert StateManager.get_cached_store("222") is not None
         assert StateManager.get_cached_store("333") is not None
+
+
+def test_default_store_falls_back_to_heb_default_store(monkeypatch):
+    """HEB_DEFAULT_STORE is the default until a store is chosen in the session."""
+    from texas_grocery_mcp.utils.config import get_settings
+
+    StateManager.set_default_store_id_sync(None)
+    monkeypatch.setenv("HEB_DEFAULT_STORE", "465")
+    get_settings.cache_clear()
+    try:
+        assert StateManager.get_default_store_id() == "465"
+        StateManager.set_default_store_id_sync("768")
+        assert StateManager.get_default_store_id() == "768"
+    finally:
+        StateManager.set_default_store_id_sync(None)
+        monkeypatch.delenv("HEB_DEFAULT_STORE")
+        get_settings.cache_clear()
+    assert StateManager.get_default_store_id() is None
