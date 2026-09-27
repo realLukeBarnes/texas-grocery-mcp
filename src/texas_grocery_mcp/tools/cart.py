@@ -1,7 +1,14 @@
-"""Cart-related MCP tools with human-in-the-loop confirmation."""
+"""Cart-related MCP tools with human-in-the-loop confirmation.
+
+HEB's cartItemV2 mutation SETS a line's quantity (it doesn't add to it), so
+cart_add and cart_add_many read the cart first, set each line to
+existing + requested (capped at MAX_CART_LINE_QUANTITY), then read the cart
+again and report the line's real quantity.
+"""
 
 from typing import TYPE_CHECKING, Annotated, Any
 
+import structlog
 from pydantic import Field
 
 from texas_grocery_mcp.auth.session import (
@@ -10,7 +17,13 @@ from texas_grocery_mcp.auth.session import (
     get_auth_instructions,
     is_authenticated,
 )
+from texas_grocery_mcp.clients.graphql import MAX_CART_LINE_QUANTITY
 from texas_grocery_mcp.state import StateManager
+from texas_grocery_mcp.utils.ids import invalid_id_error, normalize_id
+
+logger = structlog.get_logger()
+
+ID_SCHEMA_PATTERN = r"^[0-9]{1,12}$"
 
 if TYPE_CHECKING:
     from texas_grocery_mcp.clients.graphql import HEBGraphQLClient
@@ -108,6 +121,43 @@ def _extract_price_from_cart_item(item: dict[str, Any]) -> float:
     return 0.0
 
 
+def _line_quantity(item: dict[str, Any]) -> int:
+    """A cart line's quantity as an int (0 if missing or unparseable)."""
+    try:
+        return int(item.get("quantity", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _cart_lines(cart: dict[str, Any]) -> list[dict[str, Any]]:
+    """The item lines of a cartEstimated response."""
+    cart_data = cart.get("cartV2") or {}
+    items = cart_data.get("items") or []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _find_line(
+    lines: list[dict[str, Any]], product_id: str, sku_id: str
+) -> dict[str, Any] | None:
+    """Find the cart line for a SKU (or, failing that, the product)."""
+    for item in lines:
+        if _extract_sku_from_cart_item(item) == sku_id:
+            return item
+    for item in lines:
+        product = item.get("product") or {}
+        if str(product.get("id", "")) == product_id:
+            return item
+    return None
+
+
+def _line_name(item: dict[str, Any] | None) -> str | None:
+    if not item:
+        return None
+    product = item.get("product") or {}
+    name = product.get("displayName") or product.get("name")
+    return str(name) if name else None
+
+
 def cart_check_auth() -> dict[str, Any]:
     """Check if authenticated for cart operations.
 
@@ -124,6 +174,7 @@ async def cart_add(
         Field(
             description="HEB product ID (short numeric ID from search results)",
             min_length=1,
+            pattern=ID_SCHEMA_PATTERN,
         ),
     ],
     sku_id: Annotated[
@@ -131,39 +182,54 @@ async def cart_add(
         Field(
             description=(
                 "SKU ID (longer numeric ID). If not provided, uses product_id for both."
-            )
+            ),
+            pattern=ID_SCHEMA_PATTERN,
         ),
     ] = None,
     quantity: Annotated[
         int,
-        Field(description="Quantity to add", ge=1, le=99),
+        Field(description="Quantity to add to what is already in the cart", ge=1, le=99),
     ] = 1,
     confirm: Annotated[
         bool, Field(description="Set to true to confirm the action")
     ] = False,
 ) -> dict[str, Any]:
-    """Add an item to the shopping cart with verification.
+    """Add an item to the shopping cart, on top of any already there, with verification.
 
     Without confirm=true, returns a preview of the action.
-    With confirm=true, executes the action and VERIFIES it worked.
+    With confirm=true, reads the cart, sets the line to what's there plus
+    `quantity` (at most 99), then reads the cart again and reports the line's
+    real quantity.
 
     IMPORTANT: Use both product_id and sku_id from product_search results:
     - product_id: shorter ID (e.g., '127074')
     - sku_id: longer ID (e.g., '4122071073')
 
-    Returns error if item wasn't actually added to cart.
+    Returns an error or warning if the cart doesn't show the expected quantity.
     """
-    # Validate product_id
-    product_id = product_id.strip()
-    if not product_id:
+    normalized_product_id = normalize_id(product_id)
+    if normalized_product_id is None:
+        return invalid_id_error("product_id")
+    product_id = normalized_product_id
+
+    if sku_id is not None and sku_id.strip():
+        normalized_sku_id = normalize_id(sku_id)
+        if normalized_sku_id is None:
+            return invalid_id_error("sku_id")
+        effective_sku_id = normalized_sku_id
+    else:
+        effective_sku_id = product_id
+
+    if (
+        not isinstance(quantity, int)
+        or isinstance(quantity, bool)
+        or not 1 <= quantity <= MAX_CART_LINE_QUANTITY
+    ):
         return {
             "error": True,
-            "code": "INVALID_PRODUCT_ID",
-            "message": "Product ID cannot be empty or whitespace.",
+            "code": "INVALID_QUANTITY",
+            "message": f"quantity must be an integer from 1 to {MAX_CART_LINE_QUANTITY}.",
         }
-
-    # Use sku_id if provided, otherwise fall back to product_id
-    effective_sku_id = (sku_id.strip() if sku_id else None) or product_id
 
     # Check authentication first
     if not is_authenticated():
@@ -181,7 +247,10 @@ async def cart_add(
             "product_id": product_id,
             "sku_id": effective_sku_id,
             "quantity": quantity,
-            "message": "Set confirm=true to add this item to cart",
+            "message": (
+                "Set confirm=true to add this item to cart (added to any quantity "
+                "already in the cart)"
+            ),
             "note": (
                 "Ensure product_id is the SHORT ID and sku_id is the LONG ID from "
                 "product_search"
@@ -191,89 +260,131 @@ async def cart_add(
     client = _get_client()
 
     try:
-        # Get cart state BEFORE adding (to compare later)
+        # The mutation sets an absolute quantity, so the current line is needed.
         cart_before = await client.get_cart()
-        items_before: set[str] = set()
-        if not cart_before.get("error"):
-            cart_data = cart_before.get("cartV2", {})
-            for item in cart_data.get("items", []):
-                item_sku = _extract_sku_from_cart_item(item)
-                if item_sku:
-                    items_before.add(item_sku)
+        if cart_before.get("error"):
+            return {
+                "error": True,
+                "code": "CART_READ_FAILED",
+                "message": (
+                    "Could not read the cart before adding, so nothing was changed "
+                    "(adding needs the current quantity)."
+                ),
+                "product_id": product_id,
+                "sku_id": effective_sku_id,
+                "cart_error": cart_before.get("code") or cart_before.get("message"),
+            }
 
-        # Execute cart addition via GraphQL API
-        result = await client.add_to_cart(
+        line_before = _find_line(_cart_lines(cart_before), product_id, effective_sku_id)
+        previous_quantity = _line_quantity(line_before) if line_before else 0
+
+        if previous_quantity >= MAX_CART_LINE_QUANTITY:
+            return {
+                "error": True,
+                "code": "LINE_AT_MAXIMUM",
+                "message": (
+                    f"This item already has {previous_quantity} in the cart, the most a "
+                    f"line can hold ({MAX_CART_LINE_QUANTITY}). Nothing was changed."
+                ),
+                "product_id": product_id,
+                "sku_id": effective_sku_id,
+                "previous_quantity": previous_quantity,
+                "cart_quantity": previous_quantity,
+            }
+
+        target_quantity = min(previous_quantity + quantity, MAX_CART_LINE_QUANTITY)
+        capped = target_quantity < previous_quantity + quantity
+
+        result = await client.set_cart_item_quantity(
             product_id=product_id,
             sku_id=effective_sku_id,
-            quantity=quantity,
+            quantity=target_quantity,
         )
 
         if result.get("error"):
             return result
 
-        # VERIFY: Get cart state AFTER adding
+        base: dict[str, Any] = {
+            "action": "add_to_cart",
+            "product_id": product_id,
+            "sku_id": effective_sku_id,
+            "quantity_requested": quantity,
+            "previous_quantity": previous_quantity,
+            "target_quantity": target_quantity,
+            "capped": capped,
+        }
+
+        # VERIFY: read the cart again and report the line's real quantity
         cart_after = await client.get_cart()
         if cart_after.get("error"):
             return {
+                **base,
                 "warning": True,
                 "code": "VERIFICATION_UNAVAILABLE",
                 "message": (
-                    "Item may have been added, but verification failed (could not fetch cart)."
+                    "The cart was updated but could not be read back, so the new "
+                    "quantity is unconfirmed. Call cart_get to check."
                 ),
-                "product_id": product_id,
-                "sku_id": effective_sku_id,
-                "quantity": quantity,
             }
 
-        # Check if item is now in cart
-        cart_data_after = cart_after.get("cartV2", {})
-        item_found = False
-        item_quantity = 0
+        line_after = _find_line(_cart_lines(cart_after), product_id, effective_sku_id)
 
-        for item in cart_data_after.get("items", []):
-            item_sku = _extract_sku_from_cart_item(item)
-            item_product_id = item.get("product", {}).get("id")
-
-            # Match by either SKU or product_id
-            if item_sku == effective_sku_id or item_product_id == product_id:
-                item_found = True
-                item_quantity = item.get("quantity", 0)
-                break
-
-        if not item_found:
-            # Item not in cart - the add failed silently
+        if line_after is None:
             return {
+                **base,
                 "error": True,
                 "code": "CART_ADD_NOT_VERIFIED",
+                "cart_quantity": 0,
                 "message": (
-                    "Item was NOT added to cart. The API returned success but the item "
-                    "is not in your cart. This usually means the product_id/sku_id format is wrong."
+                    "Item is NOT in the cart after the update. This usually means the "
+                    "product_id/sku_id pair is wrong or the item is unavailable at the "
+                    "selected store."
                 ),
-                "product_id": product_id,
-                "sku_id": effective_sku_id,
-                "quantity": quantity,
                 "troubleshooting": [
                     "1. Ensure product_id is the SHORT numeric ID (e.g., '127074')",
                     "2. Ensure sku_id is the LONGER numeric ID (e.g., '4122071073')",
                     "3. Both IDs come from product_search results",
                     "4. The product may be out of stock at your selected store",
                 ],
-                "suggestion": (
-                    "Run product_search again and use the exact product_id and sku values "
-                    "returned."
+            }
+
+        cart_quantity = _line_quantity(line_after)
+        name = _line_name(line_after)
+        if name:
+            base["name"] = name
+
+        if cart_quantity != target_quantity:
+            return {
+                **base,
+                "warning": True,
+                "verified": False,
+                "code": "QUANTITY_MISMATCH",
+                "cart_quantity": cart_quantity,
+                "message": (
+                    f"The cart shows {cart_quantity} of this item, not the "
+                    f"{target_quantity} expected ({previous_quantity} before + "
+                    f"{quantity} requested). Call cart_get to review."
                 ),
             }
 
-        # SUCCESS - Item verified in cart
+        if capped:
+            message = (
+                f"Line capped at {MAX_CART_LINE_QUANTITY}: added "
+                f"{cart_quantity - previous_quantity} of the {quantity} requested "
+                f"(was {previous_quantity}); cart shows {cart_quantity}."
+            )
+        else:
+            message = (
+                f"Added {quantity}; cart shows {cart_quantity} of this item "
+                f"(was {previous_quantity})."
+            )
+
         return {
+            **base,
             "success": True,
             "verified": True,
-            "action": "add_to_cart",
-            "product_id": product_id,
-            "sku_id": effective_sku_id,
-            "quantity": quantity,
-            "cart_quantity": item_quantity,
-            "message": f"Added {quantity}x product to cart (verified)",
+            "cart_quantity": cart_quantity,
+            "message": message,
         }
 
     except Exception as e:
@@ -288,14 +399,19 @@ async def cart_add(
 async def cart_remove(
     product_id: Annotated[
         str,
-        Field(description="Product SKU/ID to remove", min_length=1),
+        Field(
+            description="Product ID to remove (numeric)",
+            min_length=1,
+            pattern=ID_SCHEMA_PATTERN,
+        ),
     ],
     sku_id: Annotated[
         str | None,
         Field(
             description=(
                 "SKU ID if known (will be looked up from cart if not provided)"
-            )
+            ),
+            pattern=ID_SCHEMA_PATTERN,
         ),
     ] = None,
     confirm: Annotated[
@@ -307,14 +423,16 @@ async def cart_remove(
     Without confirm=true, returns a preview of the action.
     With confirm=true, executes the action.
     """
-    # Validate product_id
-    product_id = product_id.strip()
-    if not product_id:
-        return {
-            "error": True,
-            "code": "INVALID_PRODUCT_ID",
-            "message": "Product ID cannot be empty or whitespace.",
-        }
+    normalized_product_id = normalize_id(product_id)
+    if normalized_product_id is None:
+        return invalid_id_error("product_id")
+    product_id = normalized_product_id
+
+    effective_sku_id: str | None = None
+    if sku_id is not None and sku_id.strip():
+        effective_sku_id = normalize_id(sku_id)
+        if effective_sku_id is None:
+            return invalid_id_error("sku_id")
 
     if not is_authenticated():
         return {
@@ -324,7 +442,6 @@ async def cart_remove(
         }
 
     # If sku_id not provided, look it up from the cart
-    effective_sku_id = sku_id.strip() if sku_id else None
     if not effective_sku_id:
         # Fetch cart to find the SKU ID for this product
         client = _get_client()
@@ -335,7 +452,7 @@ async def cart_remove(
                 items = cart_data.get("items", [])
                 for item in items:
                     product = item.get("product", {})
-                    if product.get("id") == product_id:
+                    if str(product.get("id", "")) == product_id:
                         # Found the product - use helper to extract SKU
                         effective_sku_id = _extract_sku_from_cart_item(item)
                         break
@@ -358,7 +475,7 @@ async def cart_remove(
     # Execute removal via setting quantity to 0
     client = _get_client()
     try:
-        result = await client.add_to_cart(
+        result = await client.set_cart_item_quantity(
             product_id=product_id,
             sku_id=effective_sku_id,
             quantity=0,  # Setting quantity to 0 removes the item
@@ -451,104 +568,6 @@ async def cart_get() -> dict[str, Any]:
 
 
 @ensure_session
-async def cart_add_with_retry(
-    product_id: Annotated[str, Field(description="HEB product ID", min_length=1)],
-    sku_id: Annotated[str | None, Field(description="SKU ID")] = None,
-    quantity: Annotated[int, Field(description="Quantity to add", ge=1, le=99)] = 1,
-    confirm: Annotated[bool, Field(description="Set to true to confirm")] = False,
-    auto_correct_ids: Annotated[
-        bool, Field(description="Attempt to auto-correct IDs if add fails")
-    ] = True,
-) -> dict[str, Any]:
-    """Add item to cart with automatic ID correction.
-
-    If the initial add fails due to ID format issues and auto_correct_ids=True,
-    this will search for the product and retry with the correct IDs.
-
-    This is a more resilient version of cart_add that can recover from
-    incorrect ID formats by looking up the product.
-    """
-    # First attempt with provided IDs
-    result = await cart_add(
-        product_id=product_id,
-        sku_id=sku_id,
-        quantity=quantity,
-        confirm=confirm,
-    )
-
-    # If not confirming or if it succeeded, return result
-    if not confirm or result.get("success") or result.get("preview"):
-        return result
-
-    # If failed with CART_ADD_NOT_VERIFIED and auto-correct is enabled
-    if result.get("code") == "CART_ADD_NOT_VERIFIED" and auto_correct_ids:
-        from texas_grocery_mcp.tools.product import product_search
-        from texas_grocery_mcp.tools.store import get_default_store_id
-
-        # Try to find product by searching with the SKU/product_id as query
-        search_query = sku_id or product_id
-        store_id = get_default_store_id()
-
-        if not store_id:
-            result["auto_correct_attempted"] = False
-            result["auto_correct_reason"] = "No default store set"
-            return result
-
-        try:
-            search_result = await product_search(
-                query=search_query,
-                store_id=store_id,
-                limit=5,
-            )
-
-            products = search_result.get("products", [])
-            if not products:
-                result["auto_correct_attempted"] = True
-                result["auto_correct_reason"] = f"No products found for '{search_query}'"
-                return result
-
-            # Find a product with valid IDs
-            for product in products:
-                correct_product_id = product.get("product_id")
-                correct_sku = product.get("sku")
-
-                # Skip if IDs are missing or are suggestion placeholders
-                if not correct_product_id or str(correct_product_id).startswith("suggestion-"):
-                    continue
-                if not correct_sku or str(correct_sku).startswith("suggestion-"):
-                    continue
-
-                # Retry with corrected IDs
-                retry_result = await cart_add(
-                    product_id=correct_product_id,
-                    sku_id=correct_sku,
-                    quantity=quantity,
-                    confirm=True,
-                )
-
-                if retry_result.get("success"):
-                    retry_result["auto_corrected"] = True
-                    retry_result["original_ids"] = {
-                        "product_id": product_id,
-                        "sku_id": sku_id,
-                    }
-                    retry_result["corrected_ids"] = {
-                        "product_id": correct_product_id,
-                        "sku_id": correct_sku,
-                    }
-                    return retry_result
-
-            result["auto_correct_attempted"] = True
-            result["auto_correct_reason"] = "Found products but retry still failed"
-
-        except Exception as e:
-            result["auto_correct_attempted"] = True
-            result["auto_correct_reason"] = f"Search failed: {e!s}"
-
-    return result
-
-
-@ensure_session
 async def cart_add_many(
     items: Annotated[
         list[dict[str, Any]],
@@ -556,6 +575,7 @@ async def cart_add_many(
             description=(
                 "List of items to add. Each item must have: "
                 "product_id (short ID), sku_id (full SKU), quantity (>=1). "
+                "Quantities are added to what is already in the cart. "
                 "Maximum 100 items per call."
             ),
         )
@@ -572,8 +592,9 @@ async def cart_add_many(
 ) -> dict[str, Any]:
     """Add multiple items to cart with a single confirmation.
 
-    This is more efficient than calling cart_add multiple times and provides
-    a single confirmation gate for the entire batch.
+    Each line is set to what is already in the cart plus the requested
+    quantity (the same SKU listed twice is summed), capped at 99. The cart
+    is read again afterwards and each line's real quantity is reported.
 
     IMPORTANT: This operation uses STRICT success semantics. If ANY item
     fails to add, the entire operation is reported as a FAILURE. Items that
@@ -588,10 +609,6 @@ async def cart_add_many(
         On success: All items added with details
         On failure: List of failed items with reasons (successful items stay in cart)
     """
-    import structlog
-
-    logger = structlog.get_logger()
-
     # Validate item count
     if not items:
         return {
@@ -616,44 +633,49 @@ async def cart_add_many(
         }
 
     # Validate each item and build normalized list
-    validated_items = []
+    validated_items: list[dict[str, Any]] = []
     validation_errors = []
 
     for idx, item in enumerate(items):
         item_errors = []
 
-        # Check required fields
-        product_id = item.get("product_id")
-        sku_id = item.get("sku_id")
+        if not isinstance(item, dict):
+            validation_errors.append({"index": idx, "errors": ["item must be an object"]})
+            continue
+
+        raw_product_id = item.get("product_id")
+        raw_sku_id = item.get("sku_id")
         quantity = item.get("quantity")
 
-        if not product_id:
-            item_errors.append("missing product_id")
-        elif not str(product_id).strip():
-            item_errors.append("product_id is empty")
+        product_id = normalize_id(raw_product_id)
+        sku_id = normalize_id(raw_sku_id)
 
-        if not sku_id:
+        if raw_product_id is None or (isinstance(raw_product_id, str) and not raw_product_id):
+            item_errors.append("missing product_id")
+        elif product_id is None:
+            item_errors.append("product_id must be 1 to 12 digits")
+
+        if raw_sku_id is None or (isinstance(raw_sku_id, str) and not raw_sku_id):
             item_errors.append("missing sku_id")
-        elif not str(sku_id).strip():
-            item_errors.append("sku_id is empty")
+        elif sku_id is None:
+            item_errors.append("sku_id must be 1 to 12 digits")
 
         if quantity is None:
             item_errors.append("missing quantity")
-        elif not isinstance(quantity, int) or quantity < 1:
+        elif not isinstance(quantity, int) or isinstance(quantity, bool) or quantity < 1:
             item_errors.append("quantity must be integer >= 1")
-        elif quantity > 99:
-            item_errors.append("quantity must be <= 99")
+        elif quantity > MAX_CART_LINE_QUANTITY:
+            item_errors.append(f"quantity must be <= {MAX_CART_LINE_QUANTITY}")
 
         if item_errors:
             validation_errors.append({
                 "index": idx,
-                "item": item,
                 "errors": item_errors,
             })
         else:
             validated_items.append({
-                "product_id": str(product_id).strip(),
-                "sku_id": str(sku_id).strip(),
+                "product_id": product_id,
+                "sku_id": sku_id,
                 "quantity": quantity,
             })
 
@@ -667,63 +689,89 @@ async def cart_add_many(
             "valid_items": len(validated_items),
         }
 
+    # Merge repeats of the same SKU so each line is set once
+    merged: dict[str, dict[str, Any]] = {}
+    for item in validated_items:
+        existing = merged.get(item["sku_id"])
+        if existing:
+            existing["quantity"] += item["quantity"]
+        else:
+            merged[item["sku_id"]] = dict(item)
+    lines_to_add = list(merged.values())
+
     # Preview mode - return what would be added
     if not confirm:
         return {
             "preview": True,
-            "items_to_add": validated_items,
-            "count": len(validated_items),
+            "items_to_add": lines_to_add,
+            "count": len(lines_to_add),
             "message": (
-                f"Review {len(validated_items)} item(s) above. Call with confirm=True "
-                "to add all to cart."
+                f"Review {len(lines_to_add)} item(s) above. Call with confirm=True "
+                "to add all to cart (added to any quantity already in the cart)."
             ),
         }
 
-    # Execute mode - add all items
+    # Execute mode
     client = _get_client()
 
-    # Get cart state before (for verification)
+    # The mutation sets absolute quantities, so read the cart first.
     cart_before = await client.get_cart()
-    items_before: dict[str, int] = {}  # sku -> quantity
-    if not cart_before.get("error"):
-        cart_data = cart_before.get("cartV2", {})
-        for cart_item in cart_data.get("items", []):
-            item_sku = _extract_sku_from_cart_item(cart_item)
-            if item_sku:
-                items_before[item_sku] = cart_item.get("quantity", 0)
+    if cart_before.get("error"):
+        return {
+            "success": False,
+            "error": True,
+            "code": "CART_READ_FAILED",
+            "message": (
+                "Could not read the cart before adding, so nothing was changed "
+                "(adding needs the current quantities)."
+            ),
+        }
+    lines_before = _cart_lines(cart_before)
 
-    # Track results
-    added_items = []
-    failed_items = []
+    set_ok: list[dict[str, Any]] = []
+    failed_items: list[dict[str, Any]] = []
 
-    # Add items one by one (respecting throttling)
-    for item in validated_items:
+    for item in lines_to_add:
         product_id = item["product_id"]
         sku_id = item["sku_id"]
         quantity = item["quantity"]
 
+        line_before = _find_line(lines_before, product_id, sku_id)
+        previous_quantity = _line_quantity(line_before) if line_before else 0
+        target_quantity = min(previous_quantity + quantity, MAX_CART_LINE_QUANTITY)
+        record = {
+            "product_id": product_id,
+            "sku_id": sku_id,
+            "quantity_requested": quantity,
+            "previous_quantity": previous_quantity,
+            "target_quantity": target_quantity,
+            "capped": target_quantity < previous_quantity + quantity,
+        }
+
+        if previous_quantity >= MAX_CART_LINE_QUANTITY:
+            failed_items.append({
+                **record,
+                "cart_quantity": previous_quantity,
+                "error": f"Line already holds the maximum ({MAX_CART_LINE_QUANTITY})",
+                "code": "LINE_AT_MAXIMUM",
+            })
+            continue
+
         try:
-            result = await client.add_to_cart(
+            result = await client.set_cart_item_quantity(
                 product_id=product_id,
                 sku_id=sku_id,
-                quantity=quantity,
+                quantity=target_quantity,
             )
 
             if result.get("error"):
                 failed_items.append({
-                    "product_id": product_id,
-                    "sku_id": sku_id,
-                    "quantity": quantity,
+                    **record,
                     "error": result.get("message", "Add failed"),
                     "code": result.get("code", "ADD_FAILED"),
                 })
             else:
-                # Tentatively mark as added (will verify later)
-                added_items.append({
-                    "product_id": product_id,
-                    "sku_id": sku_id,
-                    "quantity": quantity,
-                })
+                set_ok.append(record)
 
         except Exception as e:
             logger.warning(
@@ -732,90 +780,87 @@ async def cart_add_many(
                 error=str(e),
             )
             failed_items.append({
-                "product_id": product_id,
-                "sku_id": sku_id,
-                "quantity": quantity,
+                **record,
                 "error": str(e),
                 "code": "EXCEPTION",
             })
 
-    # Verify items in cart after all adds
+    # Verify each line against a fresh cart read
+    added_items: list[dict[str, Any]] = []
+    unverified_items: list[dict[str, Any]] = []
     cart_after = await client.get_cart()
-    if not cart_after.get("error"):
-        cart_data = cart_after.get("cartV2", {})
-        items_after: dict[str, dict[str, Any]] = {}  # sku -> {quantity, name, price}
-
-        for cart_item in cart_data.get("items", []):
-            item_sku = _extract_sku_from_cart_item(cart_item)
-            if item_sku:
-                product = cart_item.get("product", {})
-                items_after[item_sku] = {
-                    "quantity": cart_item.get("quantity", 0),
-                    "name": product.get("displayName") or product.get("name"),
-                    "price": _extract_price_from_cart_item(cart_item),
-                }
-
-        # Verify each "added" item is actually in the cart
-        verified_added = []
-        for item in added_items:
-            sku_id = item["sku_id"]
-            if sku_id in items_after:
-                cart_info = items_after[sku_id]
-                verified_added.append({
-                    "product_id": item["product_id"],
-                    "sku_id": sku_id,
-                    "name": cart_info["name"],
-                    "quantity": item["quantity"],
-                    "cart_quantity": cart_info["quantity"],
-                    "price": cart_info["price"],
-                    "line_total": round(cart_info["price"] * cart_info["quantity"], 2),
-                })
-            else:
-                # Item wasn't actually added
+    if cart_after.get("error"):
+        unverified_items = [
+            {**record, "code": "VERIFICATION_UNAVAILABLE"} for record in set_ok
+        ]
+    else:
+        lines_after = _cart_lines(cart_after)
+        for record in set_ok:
+            line_after = _find_line(lines_after, record["product_id"], record["sku_id"])
+            if line_after is None:
                 failed_items.append({
-                    "product_id": item["product_id"],
-                    "sku_id": sku_id,
-                    "quantity": item["quantity"],
-                    "error": "Item not found in cart after add (verification failed)",
+                    **record,
+                    "cart_quantity": 0,
+                    "error": "Item not found in cart after the update (verification failed)",
                     "code": "VERIFICATION_FAILED",
                 })
+                continue
 
-        added_items = verified_added
+            cart_quantity = _line_quantity(line_after)
+            price = _extract_price_from_cart_item(line_after)
+            verified = {
+                **record,
+                "name": _line_name(line_after),
+                "cart_quantity": cart_quantity,
+                "price": price,
+                "line_total": round(price * cart_quantity, 2),
+            }
+            if cart_quantity != record["target_quantity"]:
+                failed_items.append({
+                    **verified,
+                    "error": (
+                        f"Cart shows {cart_quantity}, expected {record['target_quantity']}"
+                    ),
+                    "code": "QUANTITY_MISMATCH",
+                })
+            else:
+                added_items.append(verified)
 
     # Calculate totals
     total_cost = sum(item.get("line_total", 0) for item in added_items)
 
-    # Build summary
     summary = {
-        "requested": len(validated_items),
+        "requested": len(lines_to_add),
         "added": len(added_items),
         "failed": len(failed_items),
+        "unverified": len(unverified_items),
         "total_cost": round(total_cost, 2),
     }
 
-    # Determine success/failure (strict: any failure = operation failure)
-    if failed_items:
-        return {
+    if failed_items or unverified_items:
+        response: dict[str, Any] = {
             "success": False,
-            "error": True,
-            "code": "PARTIAL_FAILURE",
+            "error": bool(failed_items),
+            "code": "PARTIAL_FAILURE" if failed_items else "VERIFICATION_UNAVAILABLE",
             "message": (
-                f"{len(failed_items)} of {len(validated_items)} item(s) could not be added "
-                "to cart."
+                f"{len(failed_items)} of {len(lines_to_add)} item(s) could not be added "
+                "or verified."
+                if failed_items
+                else "The cart was updated but could not be read back to verify it."
             ),
             "added": added_items,
             "failed": failed_items,
             "summary": summary,
-            "note": (
-                "Successfully added items remain in cart. Review failed items and retry if "
-                "needed."
-            ),
+            "note": "Items that were set remain in the cart. Call cart_get to review.",
         }
+        if unverified_items:
+            response["unverified"] = unverified_items
+            response["warning"] = True
+        return response
 
-    # All items added successfully
     return {
         "success": True,
         "added": added_items,
         "summary": summary,
-        "message": f"All {len(added_items)} item(s) added to cart successfully.",
+        "message": f"All {len(added_items)} item(s) added to cart (verified).",
     }

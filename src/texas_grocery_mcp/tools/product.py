@@ -7,6 +7,7 @@ from pydantic import Field
 
 from texas_grocery_mcp.auth.session import ensure_session
 from texas_grocery_mcp.state import StateManager
+from texas_grocery_mcp.utils.ids import invalid_id_error, normalize_id
 
 logger = structlog.get_logger()
 
@@ -36,7 +37,8 @@ async def product_search(
     store_id: Annotated[
         str | None,
         Field(
-            description="Store ID for pricing/availability. Uses default if not provided."
+            description="Store ID for pricing/availability. Uses default if not provided.",
+            pattern=r"^[0-9]{1,12}$",
         ),
     ] = None,
     limit: Annotated[
@@ -68,6 +70,11 @@ async def product_search(
 
     # Resolve store ID
     effective_store_id = store_id or get_default_store_id()
+
+    if effective_store_id:
+        effective_store_id = normalize_id(effective_store_id)
+        if effective_store_id is None:
+            return invalid_id_error("store_id")
 
     if not effective_store_id:
         return {
@@ -156,19 +163,12 @@ async def product_search(
         result["security_challenge_detected"] = True
         result["note"] = (
             "Security challenge (WAF/captcha) blocked API requests. "
-            "Use session_refresh tool or Playwright MCP to refresh your session."
+            "Call session_refresh to refresh the session."
         )
 
     # Add fallback reason if present
     if search_result.fallback_reason:
         result["fallback_reason"] = search_result.fallback_reason
-
-    # Add Playwright fallback instructions when available
-    if search_result.playwright_fallback_available and search_result.playwright_instructions:
-        result["playwright_fallback"] = {
-            "available": True,
-            "instructions": search_result.playwright_instructions,
-        }
 
     # Add search attempts for debugging (summarized)
     if search_result.attempts:
@@ -209,7 +209,10 @@ async def product_search_batch(
     ],
     store_id: Annotated[
         str | None,
-        Field(description="Store ID for pricing/availability. Uses default if not provided."),
+        Field(
+            description="Store ID for pricing/availability. Uses default if not provided.",
+            pattern=r"^[0-9]{1,12}$",
+        ),
     ] = None,
     limit_per_query: Annotated[
         int,
@@ -238,6 +241,11 @@ async def product_search_batch(
 
     # Resolve store ID
     effective_store_id = store_id or get_default_store_id()
+
+    if effective_store_id:
+        effective_store_id = normalize_id(effective_store_id)
+        if effective_store_id is None:
+            return {**invalid_id_error("store_id"), "results": []}
 
     if not effective_store_id:
         return {
@@ -328,11 +336,17 @@ async def product_search_batch(
 async def product_get(
     product_id: Annotated[
         str,
-        Field(description="Product ID from product_search results (e.g., '127074')")
+        Field(
+            description="Product ID from product_search results (e.g., '127074')",
+            pattern=r"^[0-9]{1,12}$",
+        ),
     ],
     store_id: Annotated[
         str | None,
-        Field(description="Store ID for pricing/availability. Uses default if not provided.")
+        Field(
+            description="Store ID for pricing/availability. Uses default if not provided.",
+            pattern=r"^[0-9]{1,12}$",
+        ),
     ] = None,
 ) -> dict[str, Any]:
     """Get comprehensive details for a single product.
@@ -377,8 +391,17 @@ async def product_get(
             ),
         }
 
+    normalized_product_id = normalize_id(product_id)
+    if normalized_product_id is None:
+        return invalid_id_error("product_id")
+    product_id = normalized_product_id
+
     # Resolve store ID
     effective_store_id = store_id or get_default_store_id()
+    if effective_store_id:
+        effective_store_id = normalize_id(effective_store_id)
+        if effective_store_id is None:
+            return invalid_id_error("store_id")
 
     client = _get_client()
 

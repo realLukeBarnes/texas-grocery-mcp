@@ -371,88 +371,34 @@ def mock_no_playwright(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_session_refresh_returns_commands_when_no_playwright(
+async def test_session_refresh_without_playwright_gives_no_commands(
     mock_auth_path,
     mock_no_playwright,
 ):
-    """session_refresh should return structured Playwright commands when browser not available."""
+    """Without Playwright, session_refresh fails plainly: no browser-MCP commands or code."""
     from texas_grocery_mcp.tools.session import session_refresh
 
     result = await session_refresh()
 
-    assert "commands" in result
-    assert len(result["commands"]) == 3
-
-    # Check command structure
-    commands = result["commands"]
-    assert commands[0]["tool"] == "browser_navigate"
-    assert commands[0]["parameters"]["url"] == "https://www.heb.com"
-
-    assert commands[1]["tool"] == "browser_wait_for"
-    assert commands[1]["parameters"]["time"] == 5
-
-    assert commands[2]["tool"] == "browser_run_code"
-    assert "code" in commands[2]["parameters"]
-
-    # Each command should have parameters and description
-    for cmd in commands:
-        assert "parameters" in cmd
-        assert "description" in cmd
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["error_type"] == "playwright_not_installed"
+    assert "commands" not in result
+    text = json.dumps(result).lower()
+    assert "browser_run_code" not in text
+    assert "browser_navigate" not in text
+    assert "password" not in text
 
 
 @pytest.mark.asyncio
-async def test_session_refresh_includes_auth_path(mock_auth_path, mock_no_playwright):
-    """session_refresh should include the auth file path."""
+async def test_session_refresh_has_no_credential_parameters():
+    """session_refresh takes no credential-related parameters."""
+    import inspect
+
     from texas_grocery_mcp.tools.session import session_refresh
 
-    result = await session_refresh()
-
-    assert "auth_path" in result
-    # Path should be expanded (no ~)
-    assert "~" not in result["auth_path"]
-
-
-@pytest.mark.asyncio
-async def test_session_refresh_includes_current_status(
-    mock_auth_path,
-    mock_no_playwright,
-    valid_session_cookies,
-):
-    """session_refresh should include current session status."""
-    from texas_grocery_mcp.tools.session import session_refresh
-
-    mock_auth_path.write_text(json.dumps(valid_session_cookies))
-
-    result = await session_refresh()
-
-    assert "current_status" in result
-    assert "authenticated" in result["current_status"]
-    assert "needs_refresh" in result["current_status"]
-
-
-@pytest.mark.asyncio
-async def test_session_refresh_includes_troubleshooting(mock_auth_path, mock_no_playwright):
-    """session_refresh should include troubleshooting tips."""
-    from texas_grocery_mcp.tools.session import session_refresh
-
-    result = await session_refresh()
-
-    assert "troubleshooting" in result
-    assert "no_playwright" in result["troubleshooting"]
-    assert "still_failing" in result["troubleshooting"]
-    assert "login_required" in result["troubleshooting"]
-
-
-@pytest.mark.asyncio
-async def test_session_refresh_code_saves_to_correct_path(mock_auth_path, mock_no_playwright):
-    """session_refresh code should save to the correct auth path."""
-    from texas_grocery_mcp.tools.session import session_refresh
-
-    result = await session_refresh()
-
-    # The JavaScript code in the third command should reference the auth path
-    code = result["commands"][2]["parameters"]["code"]
-    assert str(mock_auth_path) in code or result["auth_path"] in code
+    params = set(inspect.signature(session_refresh).parameters)
+    assert params == {"headless", "timeout"}
 
 
 # =============================================================================
@@ -460,25 +406,27 @@ async def test_session_refresh_code_saves_to_correct_path(mock_auth_path, mock_n
 # =============================================================================
 
 
-def test_session_clear_removes_file(mock_auth_path, valid_session_cookies):
+@pytest.mark.asyncio
+async def test_session_clear_removes_file(mock_auth_path, valid_session_cookies):
     """session_clear should remove auth file."""
     from texas_grocery_mcp.tools.session import session_clear
 
     mock_auth_path.write_text(json.dumps(valid_session_cookies))
     assert mock_auth_path.exists()
 
-    result = session_clear()
+    result = await session_clear()
 
     assert result["success"] is True
     assert not mock_auth_path.exists()
     assert "cleared_path" in result
 
 
-def test_session_clear_handles_missing_file(mock_auth_path):
+@pytest.mark.asyncio
+async def test_session_clear_handles_missing_file(mock_auth_path):
     """session_clear should handle missing file gracefully."""
     from texas_grocery_mcp.tools.session import session_clear
 
-    result = session_clear()
+    result = await session_clear()
 
     assert result["success"] is True
     assert "No session file" in result["message"]

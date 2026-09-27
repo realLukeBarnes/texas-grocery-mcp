@@ -78,3 +78,55 @@ def test_throttling_settings_from_env():
         assert settings.max_concurrent_ssr_searches == 5
         assert settings.min_ssr_delay_ms == 500
         assert settings.throttling_enabled is False
+
+
+def test_dotenv_file_is_not_read(tmp_path, monkeypatch):
+    """A .env file in the working directory must not change settings."""
+    from texas_grocery_mcp.utils.config import Settings
+
+    (tmp_path / ".env").write_text(
+        "LOG_LEVEL=DEBUG\nHEB_DEFAULT_STORE=999\nAUTH_STATE_PATH=/tmp/evil/auth.json\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    monkeypatch.delenv("HEB_DEFAULT_STORE", raising=False)
+    monkeypatch.delenv("AUTH_STATE_PATH", raising=False)
+
+    settings = Settings()
+
+    assert settings.log_level == "INFO"
+    assert settings.heb_default_store is None
+    assert str(settings.auth_state_path) != "/tmp/evil/auth.json"
+    assert Settings.model_config.get("env_file") is None
+
+
+def test_default_log_level_is_info(monkeypatch):
+    from texas_grocery_mcp.utils.config import Settings
+
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    assert Settings().log_level == "INFO"
+
+
+def test_screenshot_dir_beside_auth_state(monkeypatch, tmp_path):
+    from texas_grocery_mcp.utils.config import Settings
+
+    monkeypatch.setenv("AUTH_STATE_PATH", str(tmp_path / "home" / "auth.json"))
+    assert Settings().screenshot_dir == tmp_path / "home" / "screenshots"
+
+
+def test_heb_throttle_settings_defaults(monkeypatch):
+    from texas_grocery_mcp.utils.config import Settings
+
+    settings = Settings()
+    assert settings.max_concurrent_heb_requests == 2
+    assert settings.min_heb_request_delay_ms == 250
+    assert settings.heb_request_jitter_ms == 250
+
+
+def test_nominatim_user_agent_is_honest():
+    from texas_grocery_mcp.services.geocoding import USER_AGENT
+
+    assert USER_AGENT.startswith("texas-grocery-mcp")
+    assert "jarbis" in USER_AGENT
+    assert "curl" not in USER_AGENT.lower()
+    assert "mozilla" not in USER_AGENT.lower()

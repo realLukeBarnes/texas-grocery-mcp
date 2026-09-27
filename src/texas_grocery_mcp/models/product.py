@@ -258,12 +258,6 @@ class ProductSearchResult(BaseModel):
     search_url: str | None = Field(
         default=None, description="Direct URL to search results on heb.com"
     )
-    playwright_fallback_available: bool = Field(
-        default=False, description="Whether Playwright can be used as fallback"
-    )
-    playwright_instructions: list[str] | None = Field(
-        default=None, description="Instructions for using Playwright MCP fallback"
-    )
 
     # Session status fields (for proactive refresh guidance)
     session_needs_refresh: bool = Field(

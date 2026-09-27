@@ -1,6 +1,6 @@
 [project]
 name = "texas-grocery-mcp"
-version = "0.1.2"
+version = "0.2.0"
 description = "MCP server for HEB grocery store integration"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -18,7 +18,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "fastmcp>=2.0",
+    "fastmcp>=2.14,<3",
     "httpx>=0.27",
     "pydantic>=2.0",
     "pydantic-settings>=2.0",
@@ -26,8 +26,6 @@ dependencies = [
     "redis>=5.0",
     "structlog>=24.0",
     "prometheus-client>=0.19",
-    "keyring>=25.0",
-    "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]
@@ -47,8 +45,21 @@ dev = [
     "playwright>=1.40.0",
 ]
 
+[dependency-groups]
+# The build backend, pinned in the lock and exported into requirements-lock.txt
+# so the project can be installed with --no-build-isolation from hashed wheels.
+build = [
+    "hatchling>=1.27",
+]
+
+[tool.uv]
+# cryptography (pulled in by fastmcp via authlib/pyjwt) 49+ ships no Intel-Mac wheels.
+constraint-dependencies = [
+    "cryptography<49",
+]
+
 [project.scripts]
-texas-grocery-mcp = "texas_grocery_mcp.server:main"
+texas-grocery-mcp = "texas_grocery_mcp.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/mgwalkerjr95/texas-grocery-mcp"

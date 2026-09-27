@@ -121,3 +121,21 @@ def ensure_secure_permissions(path: Path) -> bool:
             error=str(e),
         )
         return False
+
+
+def ensure_secure_dir(path: Path) -> Path:
+    """Create a directory (and parents) and force its mode to 0o700.
+
+    Args:
+        path: Directory to create or tighten
+
+    Returns:
+        The directory path
+
+    Raises:
+        OSError: If the directory can't be created or its mode set
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True, mode=SECURE_DIR_MODE)
+    os.chmod(path, SECURE_DIR_MODE)
+    return path

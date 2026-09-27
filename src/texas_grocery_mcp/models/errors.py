@@ -35,9 +35,8 @@ class AuthRequiredResponse(BaseModel):
     message: str = Field(default="Login required for this operation")
     instructions: list[str] = Field(
         default_factory=lambda: [
-            "1. Use Playwright MCP: browser_navigate to 'https://www.heb.com/my-account/login'",
-            "2. Complete login in the browser",
-            "3. Use Playwright MCP: browser_run_code to save storage state",
-            "4. Retry this operation",
+            "1. Call session_refresh. It logs in with the HEB account configured in the "
+            "server's environment.",
+            "2. Retry this operation.",
         ]
     )

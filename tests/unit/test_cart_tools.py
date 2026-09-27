@@ -99,7 +99,7 @@ class TestCartAddMany:
 
         with patch("texas_grocery_mcp.tools.cart.is_authenticated", return_value=False):
             result = await cart_add_many(
-                items=[{"product_id": "123", "sku_id": "123-HEB", "quantity": 1}]
+                items=[{"product_id": "123", "sku_id": "1230001", "quantity": 1}]
             )
 
         assert result["auth_required"] is True
@@ -112,8 +112,8 @@ class TestCartAddMany:
         with patch("texas_grocery_mcp.tools.cart.is_authenticated", return_value=True):
             result = await cart_add_many(
                 items=[
-                    {"product_id": "123", "sku_id": "123-HEB", "quantity": 2},
-                    {"product_id": "456", "sku_id": "456-HEB", "quantity": 1},
+                    {"product_id": "123", "sku_id": "1230001", "quantity": 2},
+                    {"product_id": "456", "sku_id": "4560001", "quantity": 1},
                 ],
                 confirm=False,
             )
@@ -139,7 +139,7 @@ class TestCartAddMany:
         from texas_grocery_mcp.tools.cart import cart_add_many
 
         items = [
-            {"product_id": str(i), "sku_id": f"{i}-HEB", "quantity": 1}
+            {"product_id": str(i), "sku_id": f"{i}0001", "quantity": 1}
             for i in range(101)
         ]
 
@@ -158,7 +158,7 @@ class TestCartAddMany:
             result = await cart_add_many(
                 items=[
                     {"product_id": "123"},  # Missing sku_id and quantity
-                    {"sku_id": "456-HEB", "quantity": 1},  # Missing product_id
+                    {"sku_id": "4560001", "quantity": 1},  # Missing product_id
                 ],
                 confirm=True,
             )
@@ -175,8 +175,8 @@ class TestCartAddMany:
         with patch("texas_grocery_mcp.tools.cart.is_authenticated", return_value=True):
             result = await cart_add_many(
                 items=[
-                    {"product_id": "123", "sku_id": "123-HEB", "quantity": 0},
-                    {"product_id": "456", "sku_id": "456-HEB", "quantity": -1},
+                    {"product_id": "123", "sku_id": "1230001", "quantity": 0},
+                    {"product_id": "456", "sku_id": "4560001", "quantity": -1},
                 ],
                 confirm=True,
             )
@@ -192,25 +192,28 @@ class TestCartAddMany:
         from texas_grocery_mcp.tools.cart import cart_add_many
 
         mock_client = MagicMock()
-        mock_client.add_to_cart = AsyncMock(return_value={"success": True})
-        mock_client.get_cart = AsyncMock(return_value={
-            "cartV2": {
-                "items": [
-                    {
-                        "product": {"id": "123", "displayName": "Product 1"},
-                        "sku": {"id": "123-HEB"},
-                        "quantity": 2,
-                        "price": {"amount": 5.99},
-                    },
-                    {
-                        "product": {"id": "456", "displayName": "Product 2"},
-                        "sku": {"id": "456-HEB"},
-                        "quantity": 1,
-                        "price": {"amount": 3.99},
-                    },
-                ]
-            }
-        })
+        mock_client.set_cart_item_quantity = AsyncMock(return_value={"success": True})
+        mock_client.get_cart = AsyncMock(side_effect=[
+            {"cartV2": {"items": []}},  # before
+            {
+                "cartV2": {
+                    "items": [
+                        {
+                            "product": {"id": "123", "displayName": "Product 1"},
+                            "sku": {"id": "1230001"},
+                            "quantity": 2,
+                            "price": {"amount": 5.99},
+                        },
+                        {
+                            "product": {"id": "456", "displayName": "Product 2"},
+                            "sku": {"id": "4560001"},
+                            "quantity": 1,
+                            "price": {"amount": 3.99},
+                        },
+                    ]
+                }
+            },
+        ])
 
         with (
             patch("texas_grocery_mcp.tools.cart.is_authenticated", return_value=True),
@@ -218,8 +221,8 @@ class TestCartAddMany:
         ):
             result = await cart_add_many(
                 items=[
-                    {"product_id": "123", "sku_id": "123-HEB", "quantity": 2},
-                    {"product_id": "456", "sku_id": "456-HEB", "quantity": 1},
+                    {"product_id": "123", "sku_id": "1230001", "quantity": 2},
+                    {"product_id": "456", "sku_id": "4560001", "quantity": 1},
                 ],
                 confirm=True,
             )
@@ -240,23 +243,26 @@ class TestCartAddMany:
         mock_client = MagicMock()
 
         # First item succeeds, second fails
-        mock_client.add_to_cart = AsyncMock(side_effect=[
+        mock_client.set_cart_item_quantity = AsyncMock(side_effect=[
             {"success": True},
             {"error": True, "code": "OUT_OF_STOCK", "message": "Out of stock"},
         ])
-        mock_client.get_cart = AsyncMock(return_value={
-            "cartV2": {
-                "items": [
-                    {
-                        "product": {"id": "123", "displayName": "Product 1"},
-                        "sku": {"id": "123-HEB"},
-                        "quantity": 2,
-                        "price": {"amount": 5.99},
-                    },
-                    # Note: 456 is NOT in cart (it failed)
-                ]
-            }
-        })
+        mock_client.get_cart = AsyncMock(side_effect=[
+            {"cartV2": {"items": []}},  # before
+            {
+                "cartV2": {
+                    "items": [
+                        {
+                            "product": {"id": "123", "displayName": "Product 1"},
+                            "sku": {"id": "1230001"},
+                            "quantity": 2,
+                            "price": {"amount": 5.99},
+                        },
+                        # Note: 456 is NOT in cart (it failed)
+                    ]
+                }
+            },
+        ])
 
         with (
             patch("texas_grocery_mcp.tools.cart.is_authenticated", return_value=True),
@@ -264,8 +270,8 @@ class TestCartAddMany:
         ):
             result = await cart_add_many(
                 items=[
-                    {"product_id": "123", "sku_id": "123-HEB", "quantity": 2},
-                    {"product_id": "456", "sku_id": "456-HEB", "quantity": 1},
+                    {"product_id": "123", "sku_id": "1230001", "quantity": 2},
+                    {"product_id": "456", "sku_id": "4560001", "quantity": 1},
                 ],
                 confirm=True,
             )
@@ -287,7 +293,7 @@ class TestCartAddMany:
         from texas_grocery_mcp.tools.cart import cart_add_many
 
         mock_client = MagicMock()
-        mock_client.add_to_cart = AsyncMock(return_value={"success": True})
+        mock_client.set_cart_item_quantity = AsyncMock(return_value={"success": True})
         # Cart doesn't contain the item after add (verification failure)
         mock_client.get_cart = AsyncMock(return_value={
             "cartV2": {"items": []}
@@ -299,7 +305,7 @@ class TestCartAddMany:
         ):
             result = await cart_add_many(
                 items=[
-                    {"product_id": "123", "sku_id": "123-HEB", "quantity": 1},
+                    {"product_id": "123", "sku_id": "1230001", "quantity": 1},
                 ],
                 confirm=True,
             )

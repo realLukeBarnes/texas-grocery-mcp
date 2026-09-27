@@ -3,17 +3,48 @@
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from texas_grocery_mcp.utils.ids import is_valid_id
+
+
+def is_heb_host(host: str | None) -> bool:
+    """Return True if host is heb.com or a subdomain of it (proper suffix match).
+
+    Accepts cookie-style domains with a leading dot (".heb.com").
+    Rejects look-alikes such as "evilheb.com" or "heb.com.example.net".
+    """
+    if not host:
+        return False
+    host = host.strip().lower().lstrip(".").rstrip(".")
+    return host == "heb.com" or host.endswith(".heb.com")
+
+
+def is_heb_https_url(url: str) -> bool:
+    """Return True if url is https:// on heb.com or one of its subdomains."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    return parts.scheme == "https" and is_heb_host(parts.hostname)
+
+
+# HEB's GraphQL endpoint, pinned (HEB_GRAPHQL_URL in the environment is ignored).
+HEB_GRAPHQL_URL = "https://www.heb.com/graphql"
 
 
 class Settings(BaseSettings):
-    """Application settings loaded from environment variables."""
+    """Application settings, read from environment variables only.
+
+    No .env file is read: the process environment is the only configuration
+    source, so a file in the working directory can't redirect the server.
+    """
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
+        env_file=None,
         extra="ignore",
     )
 
@@ -21,10 +52,6 @@ class Settings(BaseSettings):
     heb_default_store: str | None = Field(
         default=None,
         description="Default HEB store ID for operations",
-    )
-    heb_graphql_url: str = Field(
-        default="https://www.heb.com/graphql",
-        description="HEB GraphQL API endpoint",
     )
 
     # Auth State
@@ -107,6 +134,26 @@ class Settings(BaseSettings):
         description="Random jitter added to GraphQL delay (0 to N ms)",
     )
 
+    # Throttling - every request to heb.com (authenticated or not)
+    max_concurrent_heb_requests: int = Field(
+        default=2,
+        ge=1,
+        le=10,
+        description="Maximum concurrent HTTP requests to heb.com",
+    )
+    min_heb_request_delay_ms: int = Field(
+        default=250,
+        ge=0,
+        le=10000,
+        description="Minimum delay between any two heb.com requests in milliseconds",
+    )
+    heb_request_jitter_ms: int = Field(
+        default=250,
+        ge=0,
+        le=5000,
+        description="Random jitter added to the heb.com request delay (0 to N ms)",
+    )
+
     # Throttling - Global
     throttling_enabled: bool = Field(
         default=True,
@@ -131,6 +178,28 @@ class Settings(BaseSettings):
             "login should be explicit)"
         ),
     )
+
+    @property
+    def heb_graphql_url(self) -> str:
+        """HEB's GraphQL endpoint. Pinned: no environment variable or file can change it."""
+        return HEB_GRAPHQL_URL
+
+    @field_validator("heb_default_store", mode="before")
+    @classmethod
+    def _default_store_must_be_digits(cls, value: Any) -> Any:
+        if value is None:
+            return None
+        value = str(value).strip()
+        if not value:
+            return None
+        if not is_valid_id(value):
+            raise ValueError("HEB_DEFAULT_STORE must be a numeric store ID")
+        return value
+
+    @property
+    def screenshot_dir(self) -> Path:
+        """Folder (mode 0700) for login screenshots, beside the auth state file."""
+        return Path(self.auth_state_path).expanduser().parent / "screenshots"
 
     def model_post_init(self, __context: Any) -> None:
         """Ensure auth state path is expanded."""
