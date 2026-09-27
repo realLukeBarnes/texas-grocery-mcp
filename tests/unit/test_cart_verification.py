@@ -165,7 +165,7 @@ class TestCartAddVerification:
 
             # API returns success but item not in cart
             client.get_cart.return_value = {"cartV2": {"items": []}}
-            client.add_to_cart.return_value = {"success": True}
+            client.set_cart_item_quantity.return_value = {"success": True}
 
             result = await cart_add(
                 product_id="127074",
@@ -206,7 +206,7 @@ class TestCartAddVerification:
                     }
                 },
             ]
-            client.add_to_cart.return_value = {"success": True}
+            client.set_cart_item_quantity.return_value = {"success": True}
 
             result = await cart_add(
                 product_id="127074",
@@ -267,7 +267,7 @@ class TestCartAddVerification:
                 {"cartV2": {"items": []}},  # Before
                 {"error": True, "code": "FETCH_FAILED"},  # After
             ]
-            client.add_to_cart.return_value = {"success": True}
+            client.set_cart_item_quantity.return_value = {"success": True}
 
             result = await cart_add(
                 product_id="127074",
@@ -278,44 +278,3 @@ class TestCartAddVerification:
 
             assert result.get("warning") is True
             assert result.get("code") == "VERIFICATION_UNAVAILABLE"
-
-
-class TestCartAddWithRetry:
-    """Tests for cart_add_with_retry auto-correction logic."""
-
-    @pytest.mark.asyncio
-    async def test_returns_success_on_first_attempt(self):
-        """Should return success without retry if first attempt works."""
-        from texas_grocery_mcp.tools.cart import cart_add_with_retry
-
-        with patch("texas_grocery_mcp.tools.cart.cart_add") as mock_cart_add:
-            mock_cart_add.return_value = {"success": True, "verified": True}
-
-            result = await cart_add_with_retry(
-                product_id="127074",
-                sku_id="4122071073",
-                quantity=1,
-                confirm=True,
-            )
-
-            assert result.get("success") is True
-            assert "auto_corrected" not in result
-            mock_cart_add.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_returns_preview_without_retry(self):
-        """Should return preview without attempting retry."""
-        from texas_grocery_mcp.tools.cart import cart_add_with_retry
-
-        with patch("texas_grocery_mcp.tools.cart.cart_add") as mock_cart_add:
-            mock_cart_add.return_value = {"preview": True}
-
-            result = await cart_add_with_retry(
-                product_id="127074",
-                sku_id="4122071073",
-                quantity=1,
-                confirm=False,
-            )
-
-            assert result.get("preview") is True
-            mock_cart_add.assert_called_once()

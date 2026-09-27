@@ -1,7 +1,8 @@
 """Session management for HEB authentication.
 
-Uses Playwright MCP's storage state for authentication.
-Provides cookie conversion for httpx-based API requests.
+The session lives in a Playwright storage-state file (auth.json) written by
+the embedded browser. This module reads it and turns its heb.com cookies into
+a domain-scoped cookie jar for httpx.
 """
 
 import json
@@ -10,11 +11,12 @@ from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from datetime import UTC, datetime
 from functools import wraps
+from http.cookiejar import Cookie, CookieJar
 from typing import Any, ParamSpec, TypedDict
 
 import structlog
 
-from texas_grocery_mcp.utils.config import get_settings
+from texas_grocery_mcp.utils.config import get_settings, is_heb_host, is_heb_https_url
 
 logger = structlog.get_logger()
 
@@ -72,6 +74,15 @@ def _is_cookie_expired(cookie: dict[str, Any]) -> bool:
     return time.time() > expires
 
 
+def _heb_local_storage(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the localStorage items of the first https heb.com origin in a storage state."""
+    for origin in state.get("origins", []) or []:
+        if isinstance(origin, dict) and is_heb_https_url(str(origin.get("origin", ""))):
+            items = origin.get("localStorage", [])
+            return items if isinstance(items, list) else []
+    return []
+
+
 def _is_reese84_valid(state: dict[str, Any]) -> bool:
     """Check if reese84 bot detection token is present and not expired.
 
@@ -85,12 +96,10 @@ def _is_reese84_valid(state: dict[str, Any]) -> bool:
     Returns:
         True if reese84 token exists and is not expired, False otherwise
     """
-    # Extract localStorage from origins
-    origins = state.get("origins", [])
-    if not origins:
+    # Extract localStorage from the heb.com origin
+    local_storage = _heb_local_storage(state)
+    if not local_storage:
         return False
-
-    local_storage = origins[0].get("localStorage", [])
 
     # Find reese84 token
     reese84_data: dict[str, Any] | None = None
@@ -134,7 +143,7 @@ def is_authenticated() -> bool:
     """Check if user is authenticated with valid, non-expired session.
 
     Checks for:
-    1. Valid auth state file from Playwright MCP
+    1. Valid auth state file (Playwright storage state from the embedded browser)
     2. Key session cookies present and not expired
     3. reese84 bot detection token present and not expired
 
@@ -158,7 +167,7 @@ def is_authenticated() -> bool:
 
         # Check for HEB session cookies
         cookies = state.get("cookies", [])
-        heb_cookies = [c for c in cookies if "heb.com" in c.get("domain", "")]
+        heb_cookies = [c for c in cookies if is_heb_host(c.get("domain"))]
 
         if not heb_cookies:
             return False
@@ -182,14 +191,15 @@ def is_authenticated() -> bool:
 
 
 def get_auth_instructions() -> list[str]:
-    """Get instructions for authenticating with Playwright MCP."""
-    settings = get_settings()
+    """Get the steps for getting an authenticated session.
+
+    The server logs in by itself with the credentials in its own environment
+    (HEB_EMAIL, HEB_PASSWORD). The agent never handles a password.
+    """
     return [
-        "1. Use Playwright MCP: browser_navigate('https://www.heb.com/my-account/login')",
-        "2. Complete the login process in the browser",
-        "3. Use Playwright MCP: browser_run_code to save storage state:",
-        f"   await page.context().storageState({{ path: '{settings.auth_state_path}' }})",
-        "4. Retry this operation",
+        "1. Call session_refresh. It logs in with the HEB account configured in the "
+        "server's environment.",
+        "2. Retry this operation.",
     ]
 
 
@@ -210,7 +220,7 @@ def check_auth() -> dict[str, Any]:
 
 
 def get_cookies() -> list[dict[str, Any]]:
-    """Get cookies for authenticated requests (Playwright format)."""
+    """Get the heb.com cookies from the auth state file (Playwright format)."""
     settings = get_settings()
     auth_path = settings.auth_state_path
 
@@ -220,81 +230,83 @@ def get_cookies() -> list[dict[str, Any]]:
     try:
         with open(auth_path) as f:
             state = json.load(f)
-        return [c for c in state.get("cookies", []) if "heb.com" in c.get("domain", "")]
+        return [
+            c
+            for c in state.get("cookies", [])
+            if isinstance(c, dict) and is_heb_host(c.get("domain"))
+        ]
     except (json.JSONDecodeError, OSError):
         return []
 
 
-def get_httpx_cookies() -> dict[str, str]:
-    """Get cookies in httpx-compatible format.
+def _to_cookiejar_cookie(cookie: dict[str, Any]) -> Cookie | None:
+    """Convert one Playwright cookie to an http.cookiejar Cookie with its own scope.
 
-    Converts Playwright storage state cookies to a simple dict
-    that can be passed to httpx.AsyncClient.
+    Keeps the cookie's domain, path, secure flag and expiry, so httpx only
+    sends it to the hosts and paths the browser would have sent it to.
+    """
+    name = cookie.get("name")
+    value = cookie.get("value")
+    domain = str(cookie.get("domain") or "").strip().lower()
+    if not name or value is None or not is_heb_host(domain):
+        return None
+
+    path = str(cookie.get("path") or "/")
+    if not path.startswith("/"):
+        path = "/"
+
+    expires_raw = cookie.get("expires", -1)
+    expires: int | None = None
+    try:
+        expires_f = float(expires_raw)
+        if expires_f > 0:
+            expires = int(expires_f)
+    except (TypeError, ValueError):
+        return None
+
+    # A leading dot means "this domain and its subdomains"; without one the
+    # cookie is host-only (the browser sends it to exactly that host).
+    domain_initial_dot = domain.startswith(".")
+    return Cookie(
+        version=0,
+        name=str(name),
+        value=str(value),
+        port=None,
+        port_specified=False,
+        domain=domain,
+        domain_specified=domain_initial_dot,
+        domain_initial_dot=domain_initial_dot,
+        path=path,
+        path_specified=True,
+        secure=bool(cookie.get("secure", False)),
+        expires=expires,
+        discard=expires is None,
+        comment=None,
+        comment_url=None,
+        rest={"HttpOnly": ""} if cookie.get("httpOnly") else {},
+    )
+
+
+def get_httpx_cookies() -> CookieJar:
+    """Get the session cookies as a domain-scoped cookie jar for httpx.
+
+    Each cookie keeps the domain and path from the Playwright storage state,
+    so it is only ever sent to heb.com hosts (never to a host a redirect or a
+    bad URL might point at). Expired cookies are skipped.
 
     Returns:
-        Dict mapping cookie names to values for HEB domains
+        CookieJar holding the unexpired heb.com cookies (possibly empty)
     """
-    cookies = get_cookies()
-    httpx_cookies: dict[str, str] = {}
-
-    for cookie in cookies:
-        # Skip expired cookies
+    jar = CookieJar()
+    for cookie in get_cookies():
         if _is_cookie_expired(cookie):
             continue
+        jar_cookie = _to_cookiejar_cookie(cookie)
+        if jar_cookie is not None:
+            jar.set_cookie(jar_cookie)
 
-        name = cookie.get("name", "")
-        value = cookie.get("value", "")
-
-        if name and value:
-            httpx_cookies[name] = value
-
-    logger.debug("Loaded cookies for httpx", count=len(httpx_cookies))
-    return httpx_cookies
-
-
-def save_browser_cookies(cookies: list[dict[str, Any]]) -> bool:
-    """Save browser cookies to auth state file.
-
-    Args:
-        cookies: List of Playwright-format cookies to save
-
-    Returns:
-        True if saved successfully, False otherwise
-    """
-    settings = get_settings()
-    auth_path = settings.auth_state_path
-
-    try:
-        # Ensure parent directory exists
-        auth_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Load existing state or create new
-        state: dict[str, Any] = {"cookies": [], "origins": []}
-        if auth_path.exists():
-            with open(auth_path) as f:
-                state = json.load(f)
-
-        # Filter to only HEB cookies from input
-        heb_cookies = [c for c in cookies if "heb.com" in c.get("domain", "")]
-
-        # Merge: replace existing HEB cookies with new ones
-        existing_non_heb = [
-            c for c in state.get("cookies", [])
-            if "heb.com" not in c.get("domain", "")
-        ]
-        state["cookies"] = existing_non_heb + heb_cookies
-
-        # Write back with secure permissions
-        from texas_grocery_mcp.utils.secure_file import write_secure_json
-
-        write_secure_json(auth_path, state)
-
-        logger.info("Saved browser cookies", count=len(heb_cookies), path=str(auth_path))
-        return True
-
-    except (OSError, json.JSONDecodeError) as e:
-        logger.error("Failed to save browser cookies", error=str(e))
-        return False
+    logger.debug("Loaded cookies for httpx", count=len(jar))
+    return jar
 
 
 def get_reese84_info() -> dict[str, Any] | None:
@@ -319,7 +331,7 @@ def get_reese84_info() -> dict[str, Any] | None:
         # Check cookies for reese84
         cookies = state.get("cookies", [])
         for cookie in cookies:
-            if cookie.get("name") == "reese84" and "heb.com" in cookie.get("domain", ""):
+            if cookie.get("name") == "reese84" and is_heb_host(cookie.get("domain")):
                 expires = cookie.get("expires", -1)
                 return {
                     "source": "cookie",
@@ -329,7 +341,7 @@ def get_reese84_info() -> dict[str, Any] | None:
 
         # Check localStorage (origins) for reese84 with renewTime
         for origin in state.get("origins", []):
-            if "heb.com" in origin.get("origin", ""):
+            if is_heb_https_url(str(origin.get("origin", ""))):
                 for item in origin.get("localStorage", []):
                     if item.get("name") == "reese84":
                         try:
@@ -402,40 +414,6 @@ def check_session_freshness() -> dict[str, Any]:
     return info
 
 
-def get_session_refresh_instructions() -> list[str]:
-    """Get instructions for refreshing the session via Playwright MCP.
-
-    Returns:
-        List of step-by-step instructions
-    """
-    settings = get_settings()
-    return [
-        "To refresh your HEB session (solves bot detection challenges):",
-        "",
-        "1. Navigate to HEB homepage to trigger bot detection refresh:",
-        "   browser_navigate('https://www.heb.com')",
-        "",
-        "2. Wait for page to fully load (bot detection runs in background):",
-        "   browser_wait_for({ state: 'networkidle' })",
-        "",
-        "3. Perform a search to verify session is working:",
-        "   browser_type('input[data-qe-id=\"headerSearchInput\"]', 'milk')",
-        "   browser_press_key('Enter')",
-        "",
-        "4. Wait for search results:",
-        "   browser_wait_for({ selector: '[data-qe-id=\"productCard\"]', timeout: 10000 })",
-        "",
-        "5. Save the refreshed session:",
-        (
-            "   browser_run_code with: await page.context().storageState({ path: '"
-            f"{settings.auth_state_path}"
-            "' })"
-        ),
-        "",
-        "6. Verify with session_status and session_refresh",
-    ]
-
-
 def get_session_info() -> dict[str, Any]:
     """Get detailed session information.
 
@@ -463,7 +441,7 @@ def get_session_info() -> dict[str, Any]:
             state = json.load(f)
 
         cookies = state.get("cookies", [])
-        heb_cookies = [c for c in cookies if "heb.com" in c.get("domain", "")]
+        heb_cookies = [c for c in cookies if is_heb_host(c.get("domain"))]
         info["cookies_count"] = len(heb_cookies)
 
         # Extract useful info from cookies
@@ -535,10 +513,7 @@ def get_session_status() -> SessionStatus:
         )
 
     # Extract reese84 info from localStorage
-    local_storage: list[dict[str, Any]] = []
-    origins = auth_data.get("origins", [])
-    if origins:
-        local_storage = origins[0].get("localStorage", [])
+    local_storage = _heb_local_storage(auth_data)
 
     reese84_data: dict[str, Any] | None = None
     for item in local_storage:
@@ -591,7 +566,7 @@ def get_session_status() -> SessionStatus:
     cookies = auth_data.get("cookies", [])
     has_valid_cookies = any(
         c.get("name") in ("sat", "DYN_USER_ID")
-        and "heb.com" in c.get("domain", "")
+        and is_heb_host(c.get("domain"))
         and (c.get("expires", 0) == -1 or c.get("expires", 0) > time.time())
         for c in cookies
     )
@@ -691,38 +666,47 @@ async def auto_refresh_session_if_needed() -> dict[str, Any] | None:
         # Import here to avoid circular imports
         from texas_grocery_mcp.auth.browser_refresh import (
             BrowserRefreshError,
-            LoginRequiredError,
             is_playwright_available,
-            refresh_session_with_browser,
+            refresh_or_login,
         )
 
         if not is_playwright_available():
             logger.warning("Auto-refresh unavailable: Playwright not installed")
             return None
 
-        result = await refresh_session_with_browser(
+        # Headless refresh; if the session has lapsed, a headless login with the
+        # environment's credentials (capped and backed off by the login limiter).
+        result = await refresh_or_login(
             auth_path=auth_path,
             headless=True,
             timeout=30000,
         )
 
-        logger.info(
-            "Session auto-refreshed successfully",
-            elapsed_seconds=result.get("elapsed_seconds"),
-        )
-        return None
+        if result.get("success"):
+            logger.info(
+                "Session auto-refreshed successfully",
+                elapsed_seconds=result.get("elapsed_seconds"),
+            )
+            return None
 
-    except LoginRequiredError:
-        logger.warning("Auto-refresh failed: manual login required")
-        return {
+        logger.warning(
+            "Auto-refresh could not restore the session",
+            status=result.get("status"),
+            error=result.get("error_type") or result.get("error"),
+        )
+        error: dict[str, Any] = {
             "error": True,
             "code": "LOGIN_REQUIRED",
             "message": (
-                "Your HEB session has expired and requires manual login. "
-                "Run session_refresh(headless=False) to log in."
+                "The HEB session has expired and the automatic login did not complete. "
+                "Call session_refresh for details."
             ),
             "auto_refresh_attempted": True,
+            "login_status": result.get("status"),
         }
+        if result.get("retry_after_seconds"):
+            error["retry_after_seconds"] = result["retry_after_seconds"]
+        return error
 
     except BrowserRefreshError as e:
         logger.warning("Auto-refresh failed", error=str(e))

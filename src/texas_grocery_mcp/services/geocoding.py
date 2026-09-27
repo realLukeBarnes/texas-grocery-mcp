@@ -12,9 +12,9 @@ logger = structlog.get_logger()
 # Nominatim API endpoint
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
-# Nominatim requires a valid User-Agent. They block custom app names
-# without real contact info. Using curl format as a pragmatic workaround.
-USER_AGENT = "curl/8.7.1"
+# Nominatim's usage policy asks for a User-Agent that identifies the
+# application honestly (no browser or curl imitation).
+USER_AGENT = "texas-grocery-mcp (jarbis; +https://github.com/realLukeBarnes/texas-grocery-mcp)"
 
 
 @dataclass

@@ -1,4 +1,6 @@
-"""Tests for ProductSearchResult diagnostics and Playwright fallback."""
+"""Tests for ProductSearchResult diagnostics."""
+
+import json
 
 import pytest
 import respx
@@ -230,7 +232,8 @@ def test_determine_fallback_reason_security_challenge():
     )
 
     assert "security" in reason.lower()
-    assert "playwright" in reason.lower()
+    assert "session_refresh" in reason
+    assert "playwright" not in reason.lower()
 
 
 def test_determine_fallback_reason_empty_results():
@@ -254,38 +257,22 @@ def test_determine_fallback_reason_empty_results():
     assert "empty" in reason.lower()
 
 
-def test_get_playwright_search_instructions_format():
-    """_get_playwright_search_instructions should return proper format."""
+def test_client_has_no_browser_mcp_instructions():
+    """The client must not offer Playwright/browser-MCP instructions to the agent."""
     from texas_grocery_mcp.clients.graphql import HEBGraphQLClient
 
     client = HEBGraphQLClient()
 
-    instructions = client._get_playwright_search_instructions("eggs", "737")
-
-    assert isinstance(instructions, list)
-    assert len(instructions) > 0
-    assert any("browser_navigate" in i for i in instructions)
-    assert any("eggs" in i for i in instructions)
-    assert any("storageState" in i for i in instructions)
-
-
-def test_get_playwright_search_instructions_encodes_query():
-    """_get_playwright_search_instructions should URL encode query."""
-    from texas_grocery_mcp.clients.graphql import HEBGraphQLClient
-
-    client = HEBGraphQLClient()
-
-    instructions = client._get_playwright_search_instructions("chicken breast", "737")
-
-    assert any("chicken+breast" in i for i in instructions)
+    assert not hasattr(client, "_get_playwright_search_instructions")
+    assert not hasattr(client, "_get_session_refresh_instructions")
 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_product_search_playwright_fallback_when_challenged(
+async def test_product_search_challenge_points_to_session_refresh_only(
     mock_typeahead_response, mock_security_challenge_html, monkeypatch
 ):
-    """product_search should provide Playwright fallback when security challenged."""
+    """A security challenge points at session_refresh, never at a browser MCP or code."""
     from texas_grocery_mcp.tools.product import product_search
 
     # Mock as authenticated
@@ -310,9 +297,12 @@ async def test_product_search_playwright_fallback_when_challenged(
     result = await product_search(query="eggs", store_id="737")
 
     assert result["security_challenge_detected"] is True
-    assert "playwright_fallback" in result
-    assert result["playwright_fallback"]["available"] is True
-    assert len(result["playwright_fallback"]["instructions"]) > 0
+    assert "playwright_fallback" not in result
+    assert "session_refresh" in result["note"]
+    text = json.dumps(result).lower()
+    assert "browser_run_code" not in text
+    assert "browser_navigate" not in text
+    assert "playwright mcp" not in text
 
 
 @pytest.mark.asyncio
@@ -359,8 +349,6 @@ def test_product_search_result_model():
         security_challenge_detected=False,
         attempts=[ProductSearchAttempt(query="test", method="ssr", result="success")],
         search_url="https://www.heb.com/search?q=test",
-        playwright_fallback_available=False,
-        playwright_instructions=None,
     )
 
     assert result.count == 1

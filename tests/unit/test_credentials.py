@@ -1,361 +1,129 @@
-"""Tests for credential storage module."""
+"""Credentials come only from HEB_EMAIL / HEB_PASSWORD and are never written anywhere."""
 
-import json
-import os
-import stat
+import tomllib
 from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[2]
+FAKE_EMAIL = "shopper@example.test"
+FAKE_PASSWORD = "not-a-real-password-7c1e"
 
-class TestCredentialStore:
-    """Tests for CredentialStore class."""
 
-    @pytest.fixture
-    def temp_auth_dir(self, tmp_path):
-        """Create a temporary auth directory."""
-        auth_dir = tmp_path / ".texas-grocery-mcp"
-        auth_dir.mkdir(parents=True)
-        return auth_dir
+def _all_files(root: Path) -> list[Path]:
+    return [p for p in root.rglob("*") if p.is_file()] if root.exists() else []
 
-    @pytest.fixture
-    def mock_keyring_unavailable(self):
-        """Mock keyring as unavailable."""
-        with patch("texas_grocery_mcp.auth.credentials.KEYRING_AVAILABLE", False):
-            yield
 
-    @pytest.fixture
-    def mock_keyring_available(self):
-        """Mock keyring as available."""
-        mock_keyring = MagicMock()
-        mock_keyring.get_password.return_value = None  # No existing credentials
-        mock_keyring.set_password.return_value = None
-        mock_keyring.delete_password.return_value = None
+class TestEnvCredentials:
+    def test_none_when_unset(self, monkeypatch):
+        from texas_grocery_mcp.auth.credentials import credentials_configured, get_env_credentials
 
-        with (
-            patch("texas_grocery_mcp.auth.credentials.KEYRING_AVAILABLE", True),
-            patch("texas_grocery_mcp.auth.credentials.keyring", mock_keyring),
-        ):
-            yield mock_keyring
+        assert get_env_credentials() is None
+        assert credentials_configured() is False
 
-    def test_init_with_keyring_available(self, temp_auth_dir, mock_keyring_available):
-        """Should use keyring when available."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
+    @pytest.mark.parametrize(
+        ("email", "password"),
+        [(FAKE_EMAIL, ""), ("", FAKE_PASSWORD), ("   ", FAKE_PASSWORD)],
+    )
+    def test_none_when_either_missing(self, monkeypatch, email, password):
+        from texas_grocery_mcp.auth.credentials import get_env_credentials
 
-        store = CredentialStore(temp_auth_dir)
-        assert store._use_keyring is True
+        monkeypatch.setenv("HEB_EMAIL", email)
+        monkeypatch.setenv("HEB_PASSWORD", password)
+        assert get_env_credentials() is None
 
-    def test_init_without_keyring(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should fall back to encrypted file when keyring unavailable."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
+    def test_read_from_environment_each_time(self, monkeypatch):
+        from texas_grocery_mcp.auth.credentials import get_env_credentials
 
-        store = CredentialStore(temp_auth_dir)
-        assert store._use_keyring is False
+        monkeypatch.setenv("HEB_EMAIL", f"  {FAKE_EMAIL} ")
+        monkeypatch.setenv("HEB_PASSWORD", FAKE_PASSWORD)
+        creds = get_env_credentials()
+        assert creds is not None
+        assert creds.email == FAKE_EMAIL
+        assert creds.password == FAKE_PASSWORD
 
-    def test_save_with_keyring(self, temp_auth_dir, mock_keyring_available):
-        """Should save credentials to keyring when available."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
+        monkeypatch.setenv("HEB_PASSWORD", "changed")
+        creds = get_env_credentials()
+        assert creds is not None
+        assert creds.password == "changed"
 
-        store = CredentialStore(temp_auth_dir)
-        result = store.save("test@example.com", "password123")
+    def test_repr_never_shows_password(self, monkeypatch):
+        from texas_grocery_mcp.auth.credentials import get_env_credentials
 
-        assert result["success"] is True
-        assert result["method"] == "keyring"
+        monkeypatch.setenv("HEB_EMAIL", FAKE_EMAIL)
+        monkeypatch.setenv("HEB_PASSWORD", FAKE_PASSWORD)
+        creds = get_env_credentials()
 
-        # Verify keyring was called correctly
-        mock_keyring_available.set_password.assert_any_call(
-            "texas-grocery-mcp", "email", "test@example.com"
+        for text in (repr(creds), str(creds), f"{creds}"):
+            assert FAKE_PASSWORD not in text
+            assert FAKE_EMAIL not in text
+
+    def test_no_credential_store_left(self):
+        import texas_grocery_mcp.auth.credentials as credentials
+
+        assert not hasattr(credentials, "CredentialStore")
+        source = Path(credentials.__file__).read_text()
+        assert "import keyring" not in source
+        assert "cryptography" not in source
+
+    def test_keyring_and_cryptography_not_dependencies(self):
+        pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
+        deps = " ".join(pyproject["project"]["dependencies"]).lower()
+        assert "keyring" not in deps
+        assert "cryptography" not in deps
+
+
+class TestNothingWritten:
+    @pytest.mark.asyncio
+    async def test_status_and_refresh_write_no_credential_files(
+        self, monkeypatch, isolated_auth_dir
+    ):
+        """With credentials set, the session tools create no files holding them."""
+        from texas_grocery_mcp.tools import session as session_tools
+
+        monkeypatch.setenv("HEB_EMAIL", FAKE_EMAIL)
+        monkeypatch.setenv("HEB_PASSWORD", FAKE_PASSWORD)
+        monkeypatch.setattr(session_tools, "is_playwright_available", lambda: False)
+
+        status = await session_tools.session_status()
+        refresh = await session_tools.session_refresh()
+        cleared = await session_tools.session_clear()
+
+        assert status["credentials_configured"] is True
+        assert status["credential_source"] == "environment"
+        for result in (status, refresh, cleared):
+            assert FAKE_PASSWORD not in str(result)
+            assert FAKE_EMAIL not in str(result)
+
+        home_files = _all_files(isolated_auth_dir)
+        assert home_files == []
+
+    @pytest.mark.asyncio
+    async def test_full_login_writes_only_session_state(self, monkeypatch, isolated_auth_dir):
+        """A login with env credentials writes auth.json (cookies) and nothing with the password."""
+        from tests.unit.fake_playwright import FakePlaywrightFactory
+        from texas_grocery_mcp.auth import browser_refresh
+
+        monkeypatch.setenv("HEB_EMAIL", FAKE_EMAIL)
+        monkeypatch.setenv("HEB_PASSWORD", FAKE_PASSWORD)
+        factory = FakePlaywrightFactory(scenario="success")
+        monkeypatch.setattr(browser_refresh, "async_playwright", factory)
+        monkeypatch.setattr(browser_refresh, "PLAYWRIGHT_AVAILABLE", True)
+        monkeypatch.setattr(
+            browser_refresh, "_login_limiter", browser_refresh.LoginAttemptLimiter()
         )
-        mock_keyring_available.set_password.assert_any_call(
-            "texas-grocery-mcp", "password", "password123"
+
+        result = await browser_refresh.auto_login_with_credentials(
+            auth_path=isolated_auth_dir / "auth.json", headless=True
         )
 
-    def test_save_encrypted_file(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should save credentials to encrypted file when keyring unavailable."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        result = store.save("test@example.com", "password123")
-
-        assert result["success"] is True
-        assert result["method"] == "encrypted_file"
-
-        # Verify files were created
-        assert (temp_auth_dir / ".credentials").exists()
-        assert (temp_auth_dir / ".credentials.key").exists()
-
-    def test_encrypted_file_permissions(self, temp_auth_dir, mock_keyring_unavailable):
-        """Encrypted files should have restrictive permissions (0o600)."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        store.save("test@example.com", "password123")
-
-        creds_path = temp_auth_dir / ".credentials"
-        key_path = temp_auth_dir / ".credentials.key"
-
-        # Check permissions (owner read/write only)
-        creds_mode = stat.S_IMODE(os.stat(creds_path).st_mode)
-        key_mode = stat.S_IMODE(os.stat(key_path).st_mode)
-
-        assert creds_mode == 0o600
-        assert key_mode == 0o600
-
-    def test_encrypted_file_not_plaintext(self, temp_auth_dir, mock_keyring_unavailable):
-        """Encrypted credentials file should not contain plaintext password."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        store.save("test@example.com", "supersecretpassword")
-
-        creds_path = temp_auth_dir / ".credentials"
-        content = creds_path.read_bytes()
-
-        # Password should NOT appear in plaintext
-        assert b"supersecretpassword" not in content
-        # File should be encrypted (not JSON)
-        with pytest.raises(json.JSONDecodeError):
-            json.loads(content.decode())
-
-    def test_get_with_keyring(self, temp_auth_dir, mock_keyring_available):
-        """Should retrieve credentials from keyring."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        # Configure mock to return credentials
-        def mock_get_password(service, key):
-            if key == "email":
-                return "test@example.com"
-            elif key == "password":
-                return "password123"
-            return None
-
-        mock_keyring_available.get_password.side_effect = mock_get_password
-
-        store = CredentialStore(temp_auth_dir)
-        result = store.get()
-
-        assert result == ("test@example.com", "password123")
-
-    def test_get_encrypted_file(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should retrieve credentials from encrypted file."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        store.save("test@example.com", "password123")
-
-        # Create new store instance to simulate fresh retrieval
-        store2 = CredentialStore(temp_auth_dir)
-        result = store2.get()
-
-        assert result == ("test@example.com", "password123")
-
-    def test_get_returns_none_when_no_credentials(
-        self, temp_auth_dir, mock_keyring_unavailable
-    ):
-        """Should return None when no credentials stored."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        result = store.get()
-
-        assert result is None
-
-    def test_clear_with_keyring(self, temp_auth_dir, mock_keyring_available):
-        """Should clear credentials from keyring."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        # Configure mock to return existing credentials
-        mock_keyring_available.get_password.return_value = "exists"
-
-        store = CredentialStore(temp_auth_dir)
-        result = store.clear()
-
-        assert result["success"] is True
-        mock_keyring_available.delete_password.assert_called()
-
-    def test_clear_encrypted_file(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should clear encrypted credentials file."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        store.save("test@example.com", "password123")
-
-        assert (temp_auth_dir / ".credentials").exists()
-
-        store.clear()
-
-        assert not (temp_auth_dir / ".credentials").exists()
-
-    def test_has_credentials_true(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should return True when credentials are stored."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        store.save("test@example.com", "password123")
-
-        assert store.has_credentials() is True
-
-    def test_has_credentials_false(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should return False when no credentials stored."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-
-        assert store.has_credentials() is False
-
-    def test_get_storage_info(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should return storage info without exposing credentials."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-
-        # Before saving
-        info = store.get_storage_info()
-        assert info["credentials_stored"] is False
-        assert info["storage_method"] == "encrypted_file"
-        assert "password" not in str(info).lower()
-
-        # After saving
-        store.save("test@example.com", "password123")
-        info = store.get_storage_info()
-        assert info["credentials_stored"] is True
-
-    def test_save_requires_email_and_password(
-        self, temp_auth_dir, mock_keyring_unavailable
-    ):
-        """Should raise error when email or password missing."""
-        from texas_grocery_mcp.auth.credentials import CredentialError, CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-
-        with pytest.raises(CredentialError, match="Email and password are required"):
-            store.save("", "password123")
-
-        with pytest.raises(CredentialError, match="Email and password are required"):
-            store.save("test@example.com", "")
-
-    def test_mask_email(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should mask email addresses for safe logging."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-
-        # Normal email
-        assert store._mask_email("user@example.com") == "u**r@example.com"
-
-        # Short local part
-        assert store._mask_email("ab@example.com") == "**@example.com"
-
-        # Long local part
-        assert store._mask_email("johndoe@example.com") == "j*****e@example.com"
-
-        # Invalid email
-        assert store._mask_email("invalid") == "***"
-        assert store._mask_email("") == "***"
-
-    def test_credential_round_trip(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should be able to save and retrieve the same credentials."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        original_email = "test.user+tag@subdomain.example.com"
-        original_password = "p@$$w0rd!with#special&chars"
-
-        store = CredentialStore(temp_auth_dir)
-        store.save(original_email, original_password)
-
-        # Fresh store instance
-        store2 = CredentialStore(temp_auth_dir)
-        retrieved = store2.get()
-
-        assert retrieved == (original_email, original_password)
-
-    def test_overwrite_existing_credentials(
-        self, temp_auth_dir, mock_keyring_unavailable
-    ):
-        """Should overwrite existing credentials when saving new ones."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-
-        # Save initial credentials
-        store.save("old@example.com", "oldpassword")
-
-        # Save new credentials
-        store.save("new@example.com", "newpassword")
-
-        # Should return new credentials
-        result = store.get()
-        assert result == ("new@example.com", "newpassword")
-
-
-class TestCredentialStoreEdgeCases:
-    """Edge case tests for CredentialStore."""
-
-    @pytest.fixture
-    def temp_auth_dir(self, tmp_path):
-        """Create a temporary auth directory."""
-        auth_dir = tmp_path / ".texas-grocery-mcp"
-        auth_dir.mkdir(parents=True)
-        return auth_dir
-
-    @pytest.fixture
-    def mock_keyring_unavailable(self):
-        """Mock keyring as unavailable."""
-        with patch("texas_grocery_mcp.auth.credentials.KEYRING_AVAILABLE", False):
-            yield
-
-    def test_corrupted_key_file(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should handle corrupted key file gracefully."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        store.save("test@example.com", "password123")
-
-        # Corrupt the key file
-        key_path = temp_auth_dir / ".credentials.key"
-        key_path.write_bytes(b"corrupted")
-
-        # Fresh store should return None (can't decrypt)
-        store2 = CredentialStore(temp_auth_dir)
-        result = store2.get()
-
-        assert result is None
-
-    def test_missing_key_file(self, temp_auth_dir, mock_keyring_unavailable):
-        """Should handle missing key file gracefully."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(temp_auth_dir)
-        store.save("test@example.com", "password123")
-
-        # Delete the key file
-        (temp_auth_dir / ".credentials.key").unlink()
-
-        # Fresh store should return None
-        store2 = CredentialStore(temp_auth_dir)
-        result = store2.get()
-
-        assert result is None
-
-    def test_auth_dir_created_if_not_exists(self, tmp_path, mock_keyring_unavailable):
-        """Should create auth directory if it doesn't exist."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        auth_dir = tmp_path / "nonexistent" / "nested" / "path"
-        assert not auth_dir.exists()
-
-        store = CredentialStore(auth_dir)
-        store.save("test@example.com", "password123")
-
-        assert auth_dir.exists()
-        assert (auth_dir / ".credentials").exists()
-
-    def test_path_with_tilde_expansion(self, mock_keyring_unavailable):
-        """Should expand ~ in path."""
-        from texas_grocery_mcp.auth.credentials import CredentialStore
-
-        store = CredentialStore(Path("~/.test-credentials"))
-
-        # Should not have ~ in the path
-        assert "~" not in str(store.auth_dir)
+        assert result["status"] == "success"
+        assert factory.last_page.filled == {
+            'input[name="email"]': FAKE_EMAIL,
+            'input[name="password"]': FAKE_PASSWORD,
+        }
+        for path in _all_files(isolated_auth_dir):
+            content = path.read_bytes()
+            assert FAKE_PASSWORD.encode() not in content, path
+        assert FAKE_PASSWORD not in str(result)
+        assert browser_refresh._pending_login_state is None

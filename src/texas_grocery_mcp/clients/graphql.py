@@ -7,6 +7,7 @@ modes. Authenticated mode uses browser session cookies for faster API access.
 import json
 import re
 from typing import Any, cast
+from urllib.parse import quote_plus
 
 import httpx
 import structlog
@@ -35,9 +36,54 @@ from texas_grocery_mcp.reliability import (
     with_retry,
 )
 from texas_grocery_mcp.services.geocoding import GeocodingResult, GeocodingService
-from texas_grocery_mcp.utils.config import get_settings
+from texas_grocery_mcp.utils.config import get_settings, is_heb_https_url
+from texas_grocery_mcp.utils.ids import require_id
 
 logger = structlog.get_logger()
+
+# Cart lines can't go above this quantity.
+MAX_CART_LINE_QUANTITY = 99
+
+
+class DisallowedHostError(httpx.RequestError):
+    """Raised when an HEB client is asked (directly or by a redirect) to leave https *.heb.com."""
+
+
+class HEBTransport(httpx.AsyncBaseTransport):
+    """Transport for every HEB client: host allowlist plus a shared throttle.
+
+    Every request, including each hop of a redirect, passes through here, so:
+    - nothing but https on heb.com or a subdomain is ever sent (a redirect
+      elsewhere is refused before any byte, or cookie, leaves); and
+    - every heb.com request, authenticated or not, waits its turn on one
+      shared throttler.
+    """
+
+    def __init__(
+        self,
+        throttler: Throttler,
+        inner: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._throttler = throttler
+        self._inner = inner or httpx.AsyncHTTPTransport()
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if not is_heb_https_url(str(request.url)):
+            logger.warning(
+                "Refused request outside https *.heb.com",
+                scheme=request.url.scheme,
+                host=request.url.host,
+            )
+            raise DisallowedHostError(
+                f"Refused request to {request.url.scheme}://{request.url.host}: "
+                "HEB clients only talk to https *.heb.com",
+                request=request,
+            )
+        async with self._throttler:
+            return await self._inner.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
 
 class GraphQLError(Exception):
@@ -122,10 +168,23 @@ class HEBGraphQLClient:
     def __init__(self, base_url: str | None = None):
         settings = get_settings()
         self.base_url = base_url or settings.heb_graphql_url
+        if not is_heb_https_url(self.base_url):
+            raise ValueError("HEB GraphQL URL must be https on heb.com")
         self.circuit_breaker = CircuitBreaker("heb_api")
         self._client: httpx.AsyncClient | None = None
         self._auth_client: httpx.AsyncClient | None = None
         self._build_id: str | None = None
+
+        # One throttler shared by every request to heb.com (see HEBTransport)
+        self._heb_throttler = Throttler(
+            ThrottleConfig(
+                max_concurrent=settings.max_concurrent_heb_requests,
+                min_delay_ms=settings.min_heb_request_delay_ms,
+                jitter_ms=settings.heb_request_jitter_ms,
+                enabled=settings.throttling_enabled,
+            ),
+            name="heb",
+        )
 
         # Initialize throttlers for rate limiting
         self._ssr_throttler = Throttler(
@@ -153,6 +212,10 @@ class HEBGraphQLClient:
             max_size=500,  # Cache up to 500 products
         )
 
+    def _make_transport(self) -> HEBTransport:
+        """Transport with the https *.heb.com allowlist and the shared throttle."""
+        return HEBTransport(self._heb_throttler)
+
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create basic HTTP client (no auth cookies)."""
         if self._client is None:
@@ -163,12 +226,18 @@ class HEBGraphQLClient:
                     "Accept": "application/json",
                     **self._BROWSER_HEADERS,
                 },
-                follow_redirects=True,
+                transport=self._make_transport(),
+                follow_redirects=True,  # hops are checked by HEBTransport
+                max_redirects=5,
             )
         return self._client
 
     async def _get_authenticated_client(self) -> httpx.AsyncClient | None:
         """Get HTTP client with authentication cookies.
+
+        The cookies keep their own domain and path (so they're only sent to
+        heb.com), and the transport refuses any request or redirect hop that
+        isn't https on heb.com or a subdomain.
 
         Returns:
             Authenticated client if cookies available, None otherwise
@@ -179,16 +248,19 @@ class HEBGraphQLClient:
         # Always recreate to get fresh cookies
         if self._auth_client:
             await self._auth_client.aclose()
+            self._auth_client = None
 
         cookies = get_httpx_cookies()
-        if not cookies:
+        if not len(cookies):
             return None
 
         self._auth_client = httpx.AsyncClient(
             timeout=httpx.Timeout(30.0),
             headers=self._BROWSER_HEADERS,
             cookies=cookies,
-            follow_redirects=True,
+            transport=self._make_transport(),
+            follow_redirects=True,  # hops are checked by HEBTransport
+            max_redirects=5,
         )
 
         logger.debug("Created authenticated client", cookie_count=len(cookies))
@@ -785,96 +857,13 @@ class HEBGraphQLClient:
         if security_challenge:
             return (
                 "Security challenge (WAF/captcha) blocked API requests. "
-                "Use session_refresh (Playwright) to refresh the session."
+                "Call session_refresh to refresh the session."
             )
         if all(a.result == "empty" for a in attempts if a.method in ("ssr", "typeahead_as_ssr")):
             return "All SSR queries returned empty results - product may not exist"
         if all(a.result == "error" for a in attempts if a.method in ("ssr", "typeahead_as_ssr")):
             return "All SSR queries failed with errors"
         return "SSR search unsuccessful"
-
-    def _get_session_refresh_instructions(self) -> list[str]:
-        """Get Playwright instructions for refreshing the session.
-
-        When session tokens are stale, use Playwright to refresh
-        the bot detection tokens before retrying API calls.
-
-        Returns:
-            Step-by-step instructions for session refresh
-        """
-        settings = get_settings()
-        return [
-            "Session refresh required. Run these Playwright commands:",
-            "",
-            "1. browser_navigate('https://www.heb.com')",
-            "",
-            "2. browser_wait_for({ time: 3 })  # Wait for bot detection to initialize",
-            "",
-            "3. browser_type('[data-qe-id=\"headerSearchInput\"]', 'test')",
-            "",
-            "4. browser_press_key('Enter')",
-            "",
-            "5. browser_wait_for({ selector: '[data-qe-id=\"productCard\"]', timeout: 10000 })",
-            "",
-            (
-                "6. browser_run_code with: await page.context().storageState({ path: '"
-                f"{settings.auth_state_path}"
-                "' })"
-            ),
-            "",
-            "Then retry your search.",
-        ]
-
-    def _get_playwright_search_instructions(self, query: str, store_id: str) -> list[str]:
-        """Get instructions for using Playwright MCP to perform the search.
-
-        When security challenges block httpx requests, Playwright can
-        bypass them because it runs in a real browser.
-
-        Args:
-            query: Original search query
-            store_id: Store ID for context
-
-        Returns:
-            Step-by-step instructions for Playwright-based search
-        """
-        encoded_query = query.replace(" ", "+")
-        return [
-            "Use Playwright MCP to search (bypasses bot detection):",
-            "",
-            f"1. browser_navigate('https://www.heb.com/search?q={encoded_query}')",
-            "",
-            "2. Wait for results to load:",
-            "   browser_wait_for({ selector: '[data-qe-id=\"productCard\"]', timeout: 10000 })",
-            "",
-            "3. Take a snapshot to see the results:",
-            "   browser_snapshot()",
-            "",
-            "4. Extract product data (optional - run in browser):",
-            "   browser_run_code with:",
-            "   ```javascript",
-            "   const products = [...document.querySelectorAll('[data-qe-id=\"productCard\"]')]",
-            "     .slice(0, 20)",
-            "     .map(card => ({",
-            (
-                "       name: card.querySelector('[data-qe-id=\"productTitle\"]')"
-                "?.textContent?.trim(),"
-            ),
-            (
-                "       price: card.querySelector('[data-qe-id=\"productPrice\"]')"
-                "?.textContent?.trim(),"
-            ),
-            "       sku: card.dataset.productId || card.querySelector('[data-sku]')?.dataset?.sku,",
-            "     }));",
-            "   return JSON.stringify(products, null, 2);",
-            "   ```",
-            "",
-            "5. After browsing, save refreshed session cookies:",
-            (
-                "   browser_run_code with: await page.context().storageState({ path: "
-                "'~/.texas-grocery-mcp/auth.json' })"
-            ),
-        ]
 
     async def search_products(
         self,
@@ -899,7 +888,7 @@ class HEBGraphQLClient:
 
         attempts: list[ProductSearchAttempt] = []
         security_challenge_detected = False
-        search_url = f"https://www.heb.com/search?q={query.replace(' ', '+')}"
+        search_url = f"https://www.heb.com/search?q={quote_plus(query)}"
 
         # Try authenticated search first
         auth_client = await self._get_authenticated_client()
@@ -1050,11 +1039,6 @@ class HEBGraphQLClient:
             security_challenge=security_challenge_detected,
         )
 
-        # Get Playwright instructions if security challenge was detected
-        playwright_instructions = None
-        if security_challenge_detected:
-            playwright_instructions = self._get_playwright_search_instructions(query, store_id)
-
         try:
             suggestions = await self.get_typeahead(query)
         except Exception as e:
@@ -1070,8 +1054,6 @@ class HEBGraphQLClient:
                 security_challenge_detected=security_challenge_detected,
                 attempts=attempts,
                 search_url=search_url,
-                playwright_fallback_available=security_challenge_detected,
-                playwright_instructions=playwright_instructions,
             )
 
         # Return suggestions as placeholder products
@@ -1108,8 +1090,6 @@ class HEBGraphQLClient:
             security_challenge_detected=security_challenge_detected,
             attempts=attempts,
             search_url=search_url,
-            playwright_fallback_available=security_challenge_detected,
-            playwright_instructions=playwright_instructions,
         )
 
     # ========================================================================
@@ -1135,7 +1115,13 @@ class HEBGraphQLClient:
 
         Returns:
             ProductDetails with full product information, or None if not found
+
+        Raises:
+            ValueError: If product_id or store_id isn't 1 to 12 digits
         """
+        product_id = require_id(product_id, "product_id")
+        if store_id is not None:
+            store_id = require_id(store_id, "store_id")
 
         # Check cache first
         cache_key = f"{product_id}:{store_id or 'default'}"
@@ -1204,6 +1190,8 @@ class HEBGraphQLClient:
         Returns:
             ProductDetails or None if not found/error
         """
+
+        product_id = require_id(product_id, "product_id")
 
         async with self._ssr_throttler:
             self.circuit_breaker.check()
@@ -1495,11 +1483,11 @@ class HEBGraphQLClient:
         async with self._ssr_throttler:
             self.circuit_breaker.check()
 
-            url = f"https://www.heb.com/search?q={query.replace(' ', '+')}"
-            logger.debug("Fetching SSR search results", url=url)
+            url = "https://www.heb.com/search"
+            logger.debug("Fetching SSR search results", url=url, query=query)
 
             try:
-                response = await client.get(url)
+                response = await client.get(url, params={"q": query})
                 response.raise_for_status()
 
                 # Check for security challenge before parsing
@@ -1740,24 +1728,43 @@ class HEBGraphQLClient:
             logger.error("Typeahead failed", term=term, error=str(e))
             return []
 
-    async def add_to_cart(
+    async def set_cart_item_quantity(
         self,
         product_id: str,
         sku_id: str,
-        quantity: int = 1,
+        quantity: int,
     ) -> dict[str, Any]:
-        """Add an item to the cart using authenticated GraphQL.
+        """Set a cart line's quantity using the cartItemV2 mutation.
+
+        ASSUMPTION: cartItemV2 SETS the line to `quantity` (an absolute value);
+        it does not add to what is already there. Quantity 0 removes the line.
+        So to add, read the cart first and pass existing + requested (the cart
+        tools do this) and verify with a cart read afterwards. If HEB ever
+        changes the mutation to increment, that verification reports the
+        mismatch instead of claiming success.
 
         Requires authentication cookies to be available.
 
         Args:
-            product_id: The product ID
-            sku_id: The SKU ID
-            quantity: Number to add
+            product_id: The product ID (1 to 12 digits)
+            sku_id: The SKU ID (1 to 12 digits)
+            quantity: The line's new total quantity (0 to 99)
 
         Returns:
             Cart response data or error dict if not authenticated
+
+        Raises:
+            ValueError: If an ID isn't 1 to 12 digits or quantity is out of range
         """
+        product_id = require_id(product_id, "product_id")
+        sku_id = require_id(sku_id, "sku_id")
+        if (
+            not isinstance(quantity, int)
+            or isinstance(quantity, bool)
+            or not 0 <= quantity <= MAX_CART_LINE_QUANTITY
+        ):
+            raise ValueError(f"quantity must be an integer from 0 to {MAX_CART_LINE_QUANTITY}")
+
         auth_client = await self._get_authenticated_client()
         if not auth_client:
             return {"error": True, "code": "NOT_AUTHENTICATED", "message": "Login required"}
@@ -2202,6 +2209,15 @@ class HEBGraphQLClient:
             - code: Error code for programmatic handling
             - verified: True if change was verified via get_cart()
         """
+        try:
+            store_id = require_id(store_id, "store_id")
+        except ValueError:
+            return {
+                "error": True,
+                "code": "INVALID_STORE_ID",
+                "message": "store_id must be 1 to 12 digits",
+            }
+
         auth_client = await self._get_authenticated_client()
         if not auth_client:
             return {

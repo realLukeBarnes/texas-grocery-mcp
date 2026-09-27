@@ -21,19 +21,20 @@ This guide covers common issues and their solutions when using the Texas Grocery
 - `session_status` shows `authenticated: false` or `needs_refresh: true`
 - Operations return "Login required" errors
 
-**Solution:**
+**Solution (login configured in the environment, `HEB_EMAIL`/`HEB_PASSWORD`):**
 ```
-1. Call session_refresh(headless=False)
-2. Complete login in the browser window that opens
-3. Tell the assistant "done" when you've logged in
-4. The assistant will call session_refresh() again to save the session
+1. Call session_refresh() - it refreshes the session, logging in headlessly if needed
+2. If it returns human_action_required with visible_browser_required, call
+   session_refresh(headless=False): a browser window opens on the server's machine
+3. Complete the CAPTCHA / code there, tell the assistant "done", and it calls
+   session_refresh() again (a waiting login is closed after 5 minutes)
 ```
 
-**If auto-login is configured:**
+**Without a configured login:**
 ```
-1. Call session_refresh() - it will attempt automatic login
-2. If CAPTCHA appears, you'll get a screenshot and need to solve it manually
-3. After solving, tell the assistant "done"
+1. Call session_refresh(headless=False)
+2. Log in by hand in the browser window that opens on the server's machine
+3. Tell the assistant "done"; it calls session_refresh() again to save the session
 ```
 
 ---
@@ -86,16 +87,18 @@ This guide covers common issues and their solutions when using the Texas Grocery
 ### Credentials Not Working
 
 **Symptoms:**
-- `session_save_credentials` succeeded but auto-login fails
+- `session_status` shows `credentials_configured: true` but login fails
 - "Invalid credentials" error during login
+- `error_type: login_rate_limited` (after repeated failures)
 
 **Solution:**
+The login comes only from the server's environment (or its `--config` file);
+no tool accepts or stores a password.
 ```
-1. Verify your HEB.com credentials work by logging in manually at heb.com
-2. Check for typos in email/password
-3. Clear and re-save credentials:
-   - session_clear_credentials()
-   - session_save_credentials(email="your@email.com", password="yourpassword")
+1. Verify the account works by logging in by hand at heb.com
+2. Fix HEB_EMAIL / HEB_PASSWORD where the server is started, then restart it
+3. Logins back off after failures (60s, 120s, then an hour); restarting the
+   server resets the limit
 4. Test with session_refresh()
 ```
 
@@ -189,7 +192,7 @@ This guide covers common issues and their solutions when using the Texas Grocery
 ```
 1. Verify the product exists: product_get(product_id="...")
 2. Check if it's available: look for available: true
-3. Try cart_add_with_retry which handles ID mismatches
+3. Run product_search again and use its exact product_id and sku values
 4. If still failing, refresh session and retry
 ```
 

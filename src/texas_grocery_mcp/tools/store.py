@@ -7,6 +7,7 @@ from pydantic import Field
 from texas_grocery_mcp.auth.session import ensure_session
 from texas_grocery_mcp.clients.graphql import KNOWN_STORES
 from texas_grocery_mcp.state import StateManager
+from texas_grocery_mcp.utils.ids import invalid_id_error, normalize_id
 
 if TYPE_CHECKING:
     from texas_grocery_mcp.clients.graphql import HEBGraphQLClient
@@ -146,7 +147,10 @@ def set_default_store_id(store_id: str | None) -> None:
 
 @ensure_session
 async def store_change(
-    store_id: Annotated[str, Field(description="Store ID to change to", min_length=1)],
+    store_id: Annotated[
+        str,
+        Field(description="Store ID to change to", min_length=1, pattern=r"^[0-9]{1,12}$"),
+    ],
     ignore_conflicts: Annotated[
         bool,
         Field(
@@ -173,7 +177,10 @@ async def store_change(
     """
     from texas_grocery_mcp.auth.session import is_authenticated
 
-    store_id = store_id.strip()
+    normalized_store_id = normalize_id(store_id)
+    if normalized_store_id is None:
+        return invalid_id_error("store_id")
+    store_id = normalized_store_id
 
     # Look up store info if available
     store_name = None
@@ -308,7 +315,10 @@ def _update_store_cookie(store_id: str) -> bool:
     """
     import json
 
-    from texas_grocery_mcp.utils.config import get_settings
+    from texas_grocery_mcp.utils.config import get_settings, is_heb_host
+
+    if normalize_id(store_id) is None:
+        return False
 
     settings = get_settings()
     auth_path = settings.auth_state_path
@@ -324,7 +334,7 @@ def _update_store_cookie(store_id: str) -> bool:
         found = False
 
         for cookie in cookies:
-            if cookie.get("name") == "CURR_SESSION_STORE" and "heb.com" in cookie.get("domain", ""):
+            if cookie.get("name") == "CURR_SESSION_STORE" and is_heb_host(cookie.get("domain")):
                 cookie["value"] = store_id
                 found = True
                 break

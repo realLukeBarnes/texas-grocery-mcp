@@ -89,7 +89,7 @@ async def coupon_list(
             "error": True,
             "code": "AUTH_REQUIRED",
             "message": (
-                "Authentication required to view coupons. Use session_save_instructions "
+                "Authentication required to view coupons. Call session_refresh "
                 "to log in."
             ),
             "coupons": [],
@@ -166,7 +166,7 @@ async def coupon_search(
             "error": True,
             "code": "AUTH_REQUIRED",
             "message": (
-                "Authentication required to search coupons. Use session_save_instructions "
+                "Authentication required to search coupons. Call session_refresh "
                 "to log in."
             ),
             "coupons": [],
@@ -230,8 +230,8 @@ async def coupon_categories() -> dict[str, Any]:
             "error": True,
             "code": "AUTH_REQUIRED",
             "message": (
-                "Authentication required to view coupon categories. Use "
-                "session_save_instructions to log in."
+                "Authentication required to view coupon categories. Call "
+                "session_refresh to log in."
             ),
             "categories": [],
         }
@@ -285,7 +285,7 @@ async def coupon_clip(
             "error": True,
             "code": "AUTH_REQUIRED",
             "message": (
-                "Authentication required to clip coupons. Use session_save_instructions "
+                "Authentication required to clip coupons. Call session_refresh "
                 "to log in."
             ),
         }
@@ -345,8 +345,8 @@ async def coupon_clipped(
             "error": True,
             "code": "AUTH_REQUIRED",
             "message": (
-                "Authentication required to view clipped coupons. Use "
-                "session_save_instructions to log in."
+                "Authentication required to view clipped coupons. Call "
+                "session_refresh to log in."
             ),
             "coupons": [],
             "count": 0,
